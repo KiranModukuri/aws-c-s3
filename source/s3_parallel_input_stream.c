@@ -6,6 +6,7 @@
 #include "aws/s3/private/s3_parallel_input_stream.h"
 
 #include <aws/common/file.h>
+#include <aws/common/system_info.h>
 #include <aws/common/task_scheduler.h>
 
 #include <aws/io/event_loop.h>
@@ -116,7 +117,20 @@ static void s_s3_parallel_from_file_read_task(struct aws_task *task, void *arg, 
     bool eof_reached = false;
     size_t actually_read = 0;
     int error_code = AWS_ERROR_SUCCESS;
+
+    /* Check if buffer is suitable for direct I/O before attempting it */
+    bool can_use_direct_io = false;
     if (impl->direct_io_read) {
+        size_t page_size = aws_system_info_page_size();
+        uint8_t *buffer_ptr = read_task->dest->buffer + read_task->dest->len;
+
+        /* Direct I/O requires buffer address to be page-aligned */
+        if ((uintptr_t)buffer_ptr % page_size == 0) {
+            can_use_direct_io = true;
+        }
+    }
+
+    if (can_use_direct_io) {
         /* Try direct IO. */
         if (aws_file_path_read_from_offset_direct_io(
                 impl->file_path, read_task->offset, read_task->length, read_task->dest, &actually_read)) {
