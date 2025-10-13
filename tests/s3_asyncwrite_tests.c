@@ -352,6 +352,42 @@ static int s_test_s3_asyncwrite_tolerate_empty_writes(struct aws_allocator *allo
     return 0;
 }
 
+/* Test that progress reporting works correctly for async writes.
+ * This verifies that request->content_length is set properly 
+ * so that progress callbacks report the correct bytes_transferred. */
+AWS_TEST_CASE(test_s3_asyncwrite_progress_reporting, s_test_s3_asyncwrite_progress_reporting)
+static int s_test_s3_asyncwrite_progress_reporting(struct aws_allocator *allocator, void *ctx) {
+    (void)ctx;
+
+    /* Test with a multipart upload (2 parts) to ensure progress is tracked across multiple parts */
+    size_t object_size = PART_SIZE * 2;
+    struct asyncwrite_tester tester;
+    ASSERT_SUCCESS(s_asyncwrite_tester_init(&tester, allocator, object_size));
+
+    /* Write data in multiple chunks */
+    struct aws_byte_cursor source_cursor = aws_byte_cursor_from_buf(&tester.source_buf);
+    size_t max_bytes_per_write = PART_SIZE / 2;
+
+    while (source_cursor.len > 0) {
+        size_t bytes_to_write = aws_min_size(max_bytes_per_write, source_cursor.len);
+        struct aws_byte_cursor write_cursor = aws_byte_cursor_advance(&source_cursor, bytes_to_write);
+        bool eof = (source_cursor.len == 0);
+        ASSERT_SUCCESS(s_write(&tester, write_cursor, eof));
+    }
+
+    /* Wait for completion */
+    aws_s3_tester_wait_for_meta_request_finish(&tester.s3_tester);
+    ASSERT_SUCCESS(s_asyncwrite_tester_validate(&tester));
+
+    /* Validate progress reporting: total_bytes_transferred should equal object_size */
+    ASSERT_UINT_EQUALS(
+        object_size,
+        tester.test_results.progress.total_bytes_transferred);
+
+    ASSERT_SUCCESS(s_asyncwrite_tester_clean_up(&tester));
+    return 0;
+}
+
 struct asyncwrite_on_another_thread_ctx {
     struct asyncwrite_tester *tester;
     size_t max_bytes_per_write;
