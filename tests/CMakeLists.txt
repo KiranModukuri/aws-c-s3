@@ -432,6 +432,17 @@ add_net_test_case(client_meta_request_override_multipart_upload_threshold)
 
 add_net_test_case(test_s3_default_get_without_content_length)
 
+# User buffer tests
+add_net_test_case(test_s3_get_object_user_buffer_single_part)
+add_net_test_case(test_s3_get_object_user_buffer_multipart)
+add_net_test_case(test_s3_put_user_buffer_rdma_single_part)
+add_net_test_case(test_s3_put_user_buffer_rdma_multipart)
+add_net_test_case(test_s3_put_user_buffer_rdma_crc32)
+add_net_test_case(test_s3_put_user_buffer_rdma_crc32c_multipart)
+add_net_test_case(test_s3_get_user_buffer_checksum_validate)
+add_net_test_case(test_s3_user_buffer_put_get_roundtrip)
+add_net_test_case(test_s3_user_buffer_too_small_error)
+
 set(TEST_BINARY_NAME ${PROJECT_NAME}-tests)
 generate_test_driver(${TEST_BINARY_NAME})
 

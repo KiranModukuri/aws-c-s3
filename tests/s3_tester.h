@@ -240,6 +240,12 @@ struct aws_s3_tester_meta_request_options {
     uint32_t mrap_test : 1;
 
     uint64_t *object_size_hint;
+
+    /* User buffer options for zero-copy transfers */
+    struct aws_s3_user_buffer_options *user_buffer_options;
+
+    /* RDMA options */
+    bool use_rdma;
 };
 
 /* TODO Rename to something more generic such as "aws_s3_meta_request_test_data" */

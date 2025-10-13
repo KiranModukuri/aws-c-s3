@@ -1540,6 +1540,8 @@ int aws_s3_tester_send_meta_request_with_options(
         .resume_token = options->put_options.resume_token,
         .object_size_hint = options->object_size_hint,
         .fio_opts = options->fio_opts,
+        .user_buffer_options = options->user_buffer_options,
+        .use_rdma = options->use_rdma,
     };
 
     if (options->mock_server) {
@@ -1821,12 +1823,17 @@ int aws_s3_tester_send_meta_request_with_options(
 
         if (options->meta_request_type == AWS_S3_META_REQUEST_TYPE_PUT_OBJECT) {
             /* Figure out how much is being uploaded from pre-existing message */
-            struct aws_input_stream *mystery_stream = aws_http_message_get_body_stream(meta_request_options.message);
-            int64_t mystery_stream_length = 0;
-            if (mystery_stream != NULL) {
-                ASSERT_SUCCESS(aws_input_stream_get_length(mystery_stream, (int64_t *)&mystery_stream_length));
+            /* For user-provided buffers, use the buffer size */
+            if (options->user_buffer_options && options->user_buffer_options->transfer_buffer_size > 0) {
+                upload_size_bytes = options->user_buffer_options->transfer_buffer_size;
+            } else {
+                struct aws_input_stream *mystery_stream = aws_http_message_get_body_stream(meta_request_options.message);
+                int64_t mystery_stream_length = 0;
+                if (mystery_stream != NULL) {
+                    ASSERT_SUCCESS(aws_input_stream_get_length(mystery_stream, (int64_t *)&mystery_stream_length));
+                }
+                upload_size_bytes = (size_t)mystery_stream_length;
             }
-            upload_size_bytes = (size_t)mystery_stream_length;
         }
     }
 
