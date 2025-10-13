@@ -288,7 +288,19 @@ struct aws_s3_request {
 
     /* When true, this request has already been uploaded. we still prepare the request to check the durability. */
     uint32_t was_previously_uploaded : 1;
-};
+
+    /* When true, this request's buffer has been registered for RDMA and is eligible for RDMA operations */
+    uint32_t rdma_buffer_registered : 1;
+
+    /* When true, the server completed RDMA transfer (detected via response headers: x-rdma-reply or x-rdma-bytes) */
+    uint32_t rdma_transfer_succeeded : 1;
+
+    /* When true, RDMA should be disabled for retry attempts due to RDMA-specific errors */
+    uint32_t disable_rdma_on_retry : 1;
+
+    /* When true, this request's buffer is a slice of user_buffer_options (skip body read for PUT) */
+    uint32_t is_user_provided_buffer : 1;
+    };
 
 AWS_EXTERN_C_BEGIN
 

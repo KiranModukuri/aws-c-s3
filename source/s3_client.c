@@ -1,5 +1,6 @@
 /**
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0.
  */
 
@@ -41,6 +42,8 @@
 
 #include <inttypes.h>
 #include <math.h>
+#include <stdlib.h>
+#include <string.h>
 
 #ifdef _MSC_VER
 #    pragma warning(disable : 4232) /* function pointer to dll symbol */
@@ -266,6 +269,133 @@ struct aws_s3express_credentials_provider *s_s3express_provider_default_factory(
     struct aws_s3express_credentials_provider *s3express_provider =
         aws_s3express_credentials_provider_new_default(allocator, &options);
     return s3express_provider;
+}
+
+/**
+ * Initialize RDMA components including provider, request handler, and buffer manager.
+ * Handles environment variable overrides and proper cleanup on failures.
+ * 
+ * @param client The S3 client to initialize RDMA for
+ * @param client_config The client configuration containing RDMA settings
+ * @param allocator The allocator to use for RDMA components
+ */
+static void s_initialize_rdma_components(
+    struct aws_s3_client *client,
+    const struct aws_s3_client_config *client_config,
+    struct aws_allocator *allocator) {
+    
+    AWS_PRECONDITION(client);
+    AWS_PRECONDITION(client_config);
+    AWS_PRECONDITION(allocator);
+
+    /* Check for RDMA configuration from environment variables */
+    struct aws_byte_cursor rdma_plugin_path = client_config->rdma_provider_plugin_path;
+    bool enable_rdma = client_config->enable_rdma;
+    size_t rdma_threshold = client_config->rdma_min_transfer_size > 0 ?
+        client_config->rdma_min_transfer_size : MB_TO_BYTES(1);
+
+    /* Override with environment variables if set */
+    const char *env_plugin_path = getenv("AWS_S3_RDMA_PLUGIN_PATH");
+    const char *env_threshold = getenv("AWS_S3_RDMA_THRESHOLD_BYTES");
+    const char *env_enable = getenv("AWS_S3_RDMA_ENABLED");
+
+    if (env_plugin_path) {
+        rdma_plugin_path = aws_byte_cursor_from_c_str(env_plugin_path);
+        enable_rdma = true; /* Auto-enable if plugin path is provided via env */
+        AWS_LOGF_TRACE(AWS_LS_S3_CLIENT, "id=%p Using RDMA plugin path from environment: %s", (void *)client, env_plugin_path);
+    }
+
+    bool threshold_from_env = false;
+    if (env_threshold) {
+        char *endptr;
+        unsigned long threshold_val = strtoul(env_threshold, &endptr, 10);
+        if (*endptr == '\0' && threshold_val > 0) {
+            rdma_threshold = (size_t)threshold_val;
+            threshold_from_env = true;
+        } else {
+            AWS_LOGF_WARN(AWS_LS_S3_CLIENT, "id=%p Invalid AWS_S3_RDMA_THRESHOLD_BYTES value '%s', using default: %zu bytes", (void *)client, env_threshold, rdma_threshold);
+        }
+    }
+
+    if (env_enable) {
+        if (strcmp(env_enable, "false") == 0 || strcmp(env_enable, "0") == 0) {
+            enable_rdma = false;
+        }
+    }
+
+    *((bool *)&client->enable_rdma) = enable_rdma;
+    *((size_t *)&client->rdma_min_transfer_size) = rdma_threshold;
+    
+    AWS_LOGF_INFO(AWS_LS_S3_CLIENT, "id=%p RDMA: enabled=%s, threshold=%zu bytes%s", 
+                  (void *)client, enable_rdma ? "true" : "false", rdma_threshold,
+                  threshold_from_env ? " (from env)" : "");
+
+    if (enable_rdma && rdma_plugin_path.len > 0) {
+        AWS_LOGF_INFO(
+            AWS_LS_S3_CLIENT,
+            "id=%p Loading RDMA provider plugin from: " PRInSTR,
+            (void *)client,
+            AWS_BYTE_CURSOR_PRI(rdma_plugin_path));
+
+        struct aws_s3_rdma_provider_config rdma_config = {
+            .allocator = allocator,
+            .plugin_path = rdma_plugin_path,
+            .enable_rdma = enable_rdma,
+            .rdma_threshold = rdma_threshold,
+            .max_concurrent_operations = 32,
+        };
+
+        int rdma_result = aws_s3_rdma_provider_new_from_plugin(
+            allocator,
+            &rdma_config,
+            &client->rdma_provider);
+
+        if (rdma_result != AWS_OP_SUCCESS || client->rdma_provider == NULL) {
+            AWS_LOGF_WARN(
+                AWS_LS_S3_CLIENT,
+                "id=%p Failed to load RDMA provider plugin, continuing without RDMA acceleration",
+                (void *)client);
+        } else {
+            /* Initialize RDMA request handler */
+            int handler_result = aws_s3_rdma_request_handler_new(
+                allocator,
+                client->rdma_provider,
+                &client->rdma_request_handler);
+                
+            if (handler_result != AWS_OP_SUCCESS || client->rdma_request_handler == NULL) {
+                AWS_LOGF_WARN(
+                    AWS_LS_S3_CLIENT,
+                    "id=%p Failed to create RDMA request handler, continuing without RDMA acceleration",
+                    (void *)client);
+                /* Clean up RDMA provider if request handler failed */
+                aws_s3_rdma_provider_release(client->rdma_provider);
+                client->rdma_provider = NULL;
+            } else {
+                /* Initialize RDMA buffer manager */
+                int buffer_manager_result = aws_s3_rdma_buffer_manager_new(
+                    allocator,
+                    client->rdma_provider,
+                    &client->rdma_buffer_manager);
+                    
+                if (buffer_manager_result != AWS_OP_SUCCESS || client->rdma_buffer_manager == NULL) {
+                    AWS_LOGF_WARN(
+                        AWS_LS_S3_CLIENT,
+                        "id=%p Failed to create RDMA buffer manager, continuing without RDMA acceleration",
+                        (void *)client);
+                    /* Clean up RDMA components if buffer manager failed */
+                    aws_s3_rdma_request_handler_release(client->rdma_request_handler);
+                    client->rdma_request_handler = NULL;
+                    aws_s3_rdma_provider_release(client->rdma_provider);
+                    client->rdma_provider = NULL;
+                } else {
+                    AWS_LOGF_INFO(
+                        AWS_LS_S3_CLIENT,
+                        "id=%p RDMA initialized successfully",
+                        (void *)client);
+                }
+            }
+        }
+    }
 }
 
 struct aws_s3_client *aws_s3_client_new(
@@ -645,6 +775,9 @@ struct aws_s3_client *aws_s3_client_new(
     *((bool *)&client->enable_read_backpressure) = client_config->enable_read_backpressure;
     *((size_t *)&client->initial_read_window) = client_config->initial_read_window;
 
+    /* Initialize RDMA provider if enabled */
+    s_initialize_rdma_components(client, client_config, allocator);
+
     return client;
 
 on_error:
@@ -803,6 +936,21 @@ static void s_s3_client_finish_destroy_default(struct aws_s3_client *client) {
         aws_string_destroy(interface_name);
     }
     aws_array_list_clean_up(&client->network_interface_names);
+
+    /* Clean up RDMA buffer manager */
+    if (client->rdma_buffer_manager) {
+        aws_s3_rdma_buffer_manager_release(client->rdma_buffer_manager);
+    }
+
+    /* Clean up RDMA request handler */
+    if (client->rdma_request_handler) {
+        aws_s3_rdma_request_handler_release(client->rdma_request_handler);
+    }
+
+    /* Clean up RDMA provider */
+    if (client->rdma_provider) {
+        aws_s3_rdma_provider_release(client->rdma_provider);
+    }
 
     aws_mem_release(client->allocator, client);
     client = NULL;
@@ -1161,6 +1309,78 @@ static void s_s3_client_endpoint_shutdown_callback(struct aws_s3_client *client)
     /* END CRITICAL SECTION */
 }
 
+/* check if the client is ready for RDMA */
+static bool aws_s3_check_rdma_ready(struct aws_s3_client *client,
+                const struct aws_s3_meta_request_options *options,
+                uint64_t content_length)
+{
+        if(client->enable_rdma == false ||
+           client->rdma_provider == NULL) {
+                AWS_LOGF_TRACE(AWS_LS_S3_CLIENT,
+                                "id=%p RDMA not enabled",
+                                (void *)client);
+                return false;
+        }
+
+        const char *env_force_rdma = getenv("AWS_S3_FORCE_RDMA");
+        bool force_plugin_rdma = false;
+        if (env_force_rdma) {
+                if (strcmp(env_force_rdma, "true") == 0 || strcmp(env_force_rdma, "1") == 0) {
+                        force_plugin_rdma = true;
+                        AWS_LOGF_TRACE(AWS_LS_S3_CLIENT, "id=%p forcing from environment: %d", (void *)client, force_plugin_rdma);
+                }
+        }
+
+        if(!force_plugin_rdma && options->use_rdma == false) {
+                AWS_LOGF_TRACE(AWS_LS_S3_CLIENT,
+                                "id=%p RDMA not enabled for the request",
+                                (void *)client);
+                return false;
+        }
+
+        if (content_length  &&
+            content_length >= client->rdma_min_transfer_size)
+        {
+                AWS_LOGF_TRACE(AWS_LS_S3_CLIENT,
+                                "id=%p Meta request eligible for RDMA: type=%d, "
+                                "content_length=%llu, object_size_hint=%llu, threshold=%zu",
+                                (void *)client, options->type, (unsigned long long)content_length,
+                                options->object_size_hint != NULL ?
+                                (unsigned long long)*options->object_size_hint : 0, client->rdma_min_transfer_size);
+                return true;
+        }
+
+        if (options->object_size_hint != NULL) {
+                if (content_length >= client->rdma_min_transfer_size ||
+                                *options->object_size_hint >= client->rdma_min_transfer_size) {
+                        AWS_LOGF_TRACE(AWS_LS_S3_CLIENT,
+                                        "id=%p Meta request eligible for RDMA: type=%d, "
+                                        "content_length=%llu, object_size_hint=%llu, threshold=%zu",
+                                        (void *)client, options->type, (unsigned long long)content_length,
+                                        (unsigned long long)*options->object_size_hint, client->rdma_min_transfer_size);
+                        return true;
+                } else {
+                        AWS_LOGF_TRACE(AWS_LS_S3_CLIENT,
+                                        "id=%p Meta request too small for RDMA: content_length=%llu < threshold=%zu",
+                                        (void *)client, (unsigned long long)content_length, client->rdma_min_transfer_size);
+                }
+        } else {
+                AWS_LOGF_TRACE(AWS_LS_S3_CLIENT,
+                        "id=%p Meta request missing content length for RDMA eligibility check, object_size_hint_ptr=%p",
+                        (void *)client, (void *)options->object_size_hint);
+
+                /* For streaming uploads with unknown content length, allow RDMA to be enabled optimistically.
+                 * Individual parts will be evaluated for RDMA eligibility during upload based on their actual size. */
+                if (options->type == AWS_S3_META_REQUEST_TYPE_PUT_OBJECT) {
+                        AWS_LOGF_TRACE(AWS_LS_S3_CLIENT,
+                                "id=%p Enabling RDMA optimistically for streaming PUT with unknown content length",
+                                (void *)client);
+                        return true;
+                }
+        }
+        return false;
+}
+
 static struct aws_s3_meta_request *s_s3_client_meta_request_factory_default(
     struct aws_s3_client *client,
     const struct aws_s3_meta_request_options *options) {
@@ -1250,14 +1470,43 @@ static struct aws_s3_meta_request *s_s3_client_meta_request_factory_default(
     if (options->send_async_stream != NULL) {
         ++body_source_count;
     }
+    if (options->user_buffer_options != NULL && 
+        options->user_buffer_options->transfer_buffer != NULL) {
+        /* user_buffer_options provides pre-existing buffer for PUT or destination buffer for GET */
+        ++body_source_count;
+        
+        /* For PUT requests, user_buffer_options requires RDMA to actually use the buffer.
+         * Without RDMA, the buffer would be ignored and an empty PUT would be sent. */
+        if (options->type == AWS_S3_META_REQUEST_TYPE_PUT_OBJECT && !options->use_rdma) {
+            AWS_LOGF_ERROR(
+                AWS_LS_S3_META_REQUEST,
+                "Could not create meta request. "
+                "user_buffer_options for PUT requires use_rdma=true. "
+                "Without RDMA, the user buffer would be ignored.");
+            aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+            return NULL;
+        }
+        
+        /* For GET requests with user_buffer, RDMA is also recommended but not strictly required.
+         * Without RDMA, data will be copied from HTTP buffer to user buffer (less efficient).
+         * We log a warning but don't fail. */
+        if (options->type == AWS_S3_META_REQUEST_TYPE_GET_OBJECT && !options->use_rdma) {
+            AWS_LOGF_WARN(
+                AWS_LS_S3_META_REQUEST,
+                "user_buffer_options for GET without RDMA will result in extra memory copy. "
+                "Consider setting use_rdma=true for zero-copy performance.");
+        }
+    }
     if (body_source_count > 1) {
         AWS_LOGF_ERROR(
             AWS_LS_S3_META_REQUEST,
             "Could not create meta request."
-            " More than one data source is set (filepath, async stream, body stream, data writes).");
+            " More than one data source is set (filepath, async stream, body stream, data writes, user buffer).");
         aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
         return NULL;
     }
+     /* check if RDMA ready */
+    bool rdma_enabled  =  aws_s3_check_rdma_ready(client, options, content_length);
     size_t part_size = client->part_size;
     if (options->part_size != 0) {
         if (options->part_size > SIZE_MAX) {
@@ -1302,12 +1551,24 @@ static struct aws_s3_meta_request *s_s3_client_meta_request_factory_default(
         }
         case AWS_S3_META_REQUEST_TYPE_PUT_OBJECT: {
             if (body_source_count == 0) {
-                AWS_LOGF_ERROR(
-                    AWS_LS_S3_META_REQUEST,
-                    "Could not create auto-ranged-put meta request."
-                    " Body must be set via filepath, async stream, or body stream.");
-                aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
-                return NULL;
+                /* RDMA-only PUT: allow zero-length body when RDMA is enabled and caller provides a user buffer.
+                 * The library will inject the RDMA token during prepare_request. */
+                bool allow_rdma_only_put = false;
+
+                if (rdma_enabled && options->use_rdma && options->user_buffer_options &&
+                    options->user_buffer_options->transfer_buffer &&
+                    options->user_buffer_options->transfer_buffer_size > 0) {
+                    allow_rdma_only_put = true;
+                }
+
+                if (!allow_rdma_only_put) {
+                    AWS_LOGF_ERROR(
+                        AWS_LS_S3_META_REQUEST,
+                        "Could not create auto-ranged-put meta request."
+                        " Body must be set via filepath, async stream, or body stream.");
+                    aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+                    return NULL;
+                }
             }
 
             if (options->resume_token == NULL) {
@@ -1360,6 +1621,19 @@ static struct aws_s3_meta_request *s_s3_client_meta_request_factory_default(
                 } else if (options->part_size != 0) {
                     /* If the threshold is not set, but the part size is set for the meta request, use it */
                     multipart_upload_threshold = part_size;
+                } else if (rdma_enabled) {
+                    /* RDMA: bump part_size up to RDMA minimum (when both knobs unset)
+                     * Intent: ensure any multipart uploads use parts large enough for RDMA,
+                     * while preserving the caller/client's existing MPU threshold policy unless explicitly aligned.
+                     * S3 still enforces a minimum for non-final parts.
+                     */
+                    size_t rdma_min = client->rdma_min_transfer_size;
+                    if (rdma_min < (size_t)g_s3_min_upload_part_size) {
+                            rdma_min = (size_t)g_s3_min_upload_part_size;
+                    }
+                    if (part_size < rdma_min) {
+                            part_size = rdma_min;
+                    }
                 }
 
                 if (content_length_found && content_length <= multipart_upload_threshold) {
@@ -1372,6 +1646,7 @@ static struct aws_s3_meta_request *s_s3_client_meta_request_factory_default(
                             !aws_http_headers_has(initial_message_headers, g_content_md5_header_name),
                         options);
                 }
+                
                 return aws_s3_meta_request_auto_ranged_put_new(
                     client->allocator, client, part_size, content_length_found, content_length, num_parts, options);
             } else { /* else using resume token */

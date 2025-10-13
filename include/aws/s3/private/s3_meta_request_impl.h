@@ -149,6 +149,15 @@ struct aws_s3_meta_request {
     struct aws_parallel_input_stream *request_body_parallel_stream;
     bool request_body_using_async_writes;
 
+    /* Whether this meta-request should attempt to use RDMA internally */
+    bool use_rdma;
+
+    /* EXPERIMENTAL: User-provided buffer options for GET (copied from options if provided) */
+    struct aws_s3_user_buffer_options user_buffer_options;
+
+    /*rdma_content_size */
+    uint64_t rdma_content_length;
+
     /* Part size to use for uploads and downloads.  Passed down by the creating client. */
     const size_t part_size;
 

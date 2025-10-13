@@ -1,5 +1,6 @@
 /**
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0.
  */
 
@@ -603,6 +604,8 @@ static bool s_s3_auto_ranged_put_update(
                 if (meta_request->synced_data.async_write.ready_to_send) {
                     /* Async-write already has a buffer */
                     request->request_body = meta_request->synced_data.async_write.buffered_data;
+                    /* Set content_length for progress reporting (async writes skip file read) */
+                    request->content_length = request->request_body.len;
                 }
 
                 ++auto_ranged_put->threaded_update_data.next_part_number;
@@ -682,6 +685,15 @@ static bool s_s3_auto_ranged_put_update(
             if (meta_request->synced_data.finish_result.error_code == AWS_ERROR_S3_PAUSED ||
                 meta_request->synced_data.finish_result.error_code == AWS_ERROR_S3_RESUME_FAILED) {
                 goto no_work_remaining;
+            }
+
+            /* If the upload failed due to RDMA error but pause was initiated, treat as paused.
+             * RDMA errors are retriable, so we should preserve the multipart upload for resume. */
+            if (meta_request->synced_data.finish_result.error_code == AWS_ERROR_S3_RDMA_INVALID_TOKEN) {
+                /* Check if pause was requested by looking at the state */
+                if (meta_request->synced_data.state == AWS_S3_META_REQUEST_STATE_FINISHED) {
+                    goto no_work_remaining;
+                }
             }
 
             /* If the complete-multipart-upload completed successfully, then there is nothing to abort since the
@@ -1064,11 +1076,49 @@ on_done:
     }
     return AWS_OP_SUCCESS;
 }
+/**
+ * Check if buffer should be registered for RDMA.
+ * Returns true if all conditions for RDMA registration are met.
+ */
+static bool s_should_register_buffer_for_rdma(
+    struct aws_s3_client *client,
+    struct aws_s3_meta_request *meta_request,
+    struct aws_s3_request *request) {
+
+    /* Check all conditions for RDMA registration */
+    if (!client || !client->enable_rdma || !client->rdma_provider) {
+        return false;
+    }
+
+    if (!meta_request->use_rdma) {
+        return false;
+    }
+
+    if (!request->request_body.buffer || request->request_body.capacity == 0) {
+        return false;
+    }
+
+    if (request->request_body.len == 0) {
+        return false;
+    }
+
+    if (request->request_body.capacity < client->rdma_min_transfer_size) {
+        return false;
+    }
+
+    if (request->rdma_buffer_registered) {
+        /* Already registered, avoid duplicate registration */
+        return false;
+    }
+
+    return true;
+}
 
 /* Prepare an UploadPart request */
 struct aws_future_http_message *s_s3_prepare_upload_part(struct aws_s3_request *request) {
     struct aws_s3_meta_request *meta_request = request->meta_request;
     struct aws_allocator *allocator = request->allocator;
+    struct aws_s3_auto_ranged_put *auto_ranged_put = meta_request->impl;
 
     struct aws_future_http_message *message_future = aws_future_http_message_new(allocator);
 
@@ -1108,18 +1158,107 @@ struct aws_future_http_message *s_s3_prepare_upload_part(struct aws_s3_request *
          * skipped over parts that were already uploaded (in case we're resuming
          * from an upload that had been paused) */
 
-        /* Read the body */
+        /* Calculate body size and offset for this part */
         uint64_t offset = 0;
         size_t request_body_size = s_compute_request_body_size(meta_request, request->part_number, &offset);
+        
+        /* If user provided a buffer for PUT, map this request's part into that buffer (no copy needed) */
+        if (meta_request->use_rdma && meta_request->user_buffer_options.transfer_buffer) {
+            void *base = meta_request->user_buffer_options.transfer_buffer;
+            size_t base_size = meta_request->user_buffer_options.transfer_buffer_size;
+            
+            /* Validate buffer bounds */
+            if (offset <= base_size && (offset + request_body_size) <= base_size) {
+                uint8_t *ptr = (uint8_t *)base + offset;
+                request->request_body.buffer = ptr;
+                request->request_body.len = request_body_size;  /* For PUT, data is already in buffer */
+                request->request_body.capacity = request_body_size;
+                request->content_length = request_body_size;  /* For progress reporting (skips file read) */
+                request->is_user_provided_buffer = 1;  /* Mark to skip read step */
+            } else {
+                AWS_LOGF_ERROR(
+                    AWS_LS_S3_META_REQUEST,
+                    "id=%p User buffer too small for part %u: offset=%llu size=%zu base_size=%zu",
+                    (void *)meta_request,
+                    request->part_number,
+                    (unsigned long long)offset,
+                    request_body_size,
+                    base_size);
+                /* Fall back to normal path below */
+            }
+        }
+        
+        /* Normal path: allocate buffer from pool if not using user buffer */
         if (request->request_body.capacity == 0) {
             AWS_FATAL_ASSERT(request->ticket);
             request->request_body = aws_s3_buffer_ticket_claim(request->ticket);
             request->request_body.capacity = request_body_size;
         }
 
-        part_prep->asyncstep_read_part = aws_s3_meta_request_read_body(meta_request, offset, &request->request_body);
-        aws_future_bool_register_callback(
-            part_prep->asyncstep_read_part, s_s3_prepare_upload_part_on_read_done, part_prep);
+        /* RDMA OPTIMIZATION: Register buffer for RDMA (both user buffers and pool buffers)
+         * Even if the full buffer is pre-registered at the system level, we need to register
+         * each slice (offset + size) with the RDMA provider for proper token generation */
+        struct aws_s3_client *client = meta_request->client;
+        if (s_should_register_buffer_for_rdma(client, meta_request, request)) {
+            if (aws_s3_rdma_provider_is_memory_suitable(client->rdma_provider,
+                                                        request->request_body.buffer,
+                                                        request->request_body.capacity)) {
+                if (client->rdma_buffer_manager) {
+                    int register_result = aws_s3_rdma_buffer_manager_prepare_buffer_for_rdma(
+                        client->rdma_buffer_manager,
+                        request,
+                        request->request_body.buffer,
+                        request->request_body.capacity);
+
+                    if (register_result != AWS_OP_SUCCESS) {
+                        AWS_LOGF_WARN(
+                            AWS_LS_S3_META_REQUEST,
+                            "id=%p Part %u: Failed to register buffer for RDMA (result=%d)",
+                            (void *)meta_request,
+                            request->part_number,
+                            register_result);
+                    }
+                }
+            }
+        }
+
+        /* For user-provided buffers, data is already in place - skip read step */
+        if (request->is_user_provided_buffer) {
+            /* BEGIN CRITICAL SECTION */
+            aws_s3_meta_request_lock_synced_data(meta_request);
+            
+            --auto_ranged_put->synced_data.num_parts_pending_read;
+            
+            /* Create part_info for this part (same logic as in s_s3_prepare_upload_part_on_read_done) */
+            if (!request->is_noop) {
+                /* Resize array-list to hold this part, filling intermediate slots with NULL */
+                aws_array_list_ensure_capacity(&auto_ranged_put->synced_data.part_list, request->part_number);
+                while (aws_array_list_length(&auto_ranged_put->synced_data.part_list) < request->part_number) {
+                    struct aws_s3_mpu_part_info *null_part = NULL;
+                    aws_array_list_push_back(&auto_ranged_put->synced_data.part_list, &null_part);
+                }
+                /* Add part to array-list */
+                struct aws_s3_mpu_part_info *part =
+                    aws_mem_calloc(meta_request->allocator, 1, sizeof(struct aws_s3_mpu_part_info));
+                part->checksum_context =
+                    aws_s3_upload_request_checksum_context_new(meta_request->allocator, &meta_request->checksum_config);
+                part->size = request->request_body.len;
+                aws_array_list_set_at(&auto_ranged_put->synced_data.part_list, &part, request->part_number - 1);
+            }
+            
+            aws_s3_meta_request_unlock_synced_data(meta_request);
+            /* END CRITICAL SECTION */
+            
+            /* Schedule client work to process more parts */
+            aws_s3_client_schedule_process_work(meta_request->client);
+            
+            s_s3_prepare_upload_part_finish(part_prep, AWS_ERROR_SUCCESS);
+        } else {
+            /* Normal path: read data from body stream into buffer */
+            part_prep->asyncstep_read_part = aws_s3_meta_request_read_body(meta_request, offset, &request->request_body);
+            aws_future_bool_register_callback(
+                part_prep->asyncstep_read_part, s_s3_prepare_upload_part_on_read_done, part_prep);
+        }
     } else {
         /* Not the first time preparing request (e.g. retry).
          * We can skip over the async steps that read the body stream */
@@ -1223,6 +1362,27 @@ static void s_s3_prepare_upload_part_finish(struct aws_s3_prepare_upload_part_jo
             aws_string_c_str(auto_ranged_put->upload_id));
     }
 
+    /* Determine if RDMA should be used for this request.
+     * By this point, request_body.len is always correct:
+     * - User buffers: len was set when buffer was mapped (line 1172)
+     * - Async writes: len was already set when buffer was provided (line 606)
+     * - File uploads: len was set after file read completed (line 1310)
+     * - Empty files: len = 0 (skip RDMA)
+     * NOTE: rdma_buffer_registered is not set yet (happens later during token generation) */
+    bool is_rdma_request = client->enable_rdma && 
+                           meta_request->use_rdma &&
+                           !request->disable_rdma_on_retry &&
+                           request->request_body.buffer != NULL &&
+                           request->request_body.len > 0 &&  /* Skip RDMA for empty files */
+                           request->request_body.len >= client->rdma_min_transfer_size;
+
+    /* If buffer was pre-registered but RDMA eligibility check failed (e.g., size < threshold),
+     * deregister it so signing will correctly use STREAMING-UNSIGNED-PAYLOAD-TRAILER instead of UNSIGNED-PAYLOAD */
+    if (!is_rdma_request && request->rdma_buffer_registered && client->rdma_buffer_manager) {
+        aws_s3_rdma_buffer_manager_finalize_buffer(client->rdma_buffer_manager, request);
+        request->rdma_buffer_registered = 0;
+    }
+
     /* Create a new put-object message to upload a part. */
     struct aws_http_message *message = NULL;
     if (request->request_body_stream != NULL) {
@@ -1238,7 +1398,7 @@ static void s_s3_prepare_upload_part_finish(struct aws_s3_prepare_upload_part_jo
         message = aws_s3_upload_part_message_new(
             meta_request->allocator,
             meta_request->initial_request_message,
-            &request->request_body,
+            is_rdma_request ? NULL : &request->request_body,  /* Skip HTTP body assignment for RDMA */
             request->part_number,
             auto_ranged_put->upload_id,
             meta_request->should_compute_content_md5,
@@ -1660,6 +1820,45 @@ static void s_s3_auto_ranged_put_request_finished(
                          * later, so just get rid of the quotes now. */
                         etag = aws_strip_quotes(meta_request->allocator, etag_within_quotes);
                     }
+
+                    /* Track checksum handling in part response */
+                    bool is_rdma_request = request->rdma_buffer_registered ||
+                                         (request->send_data.message &&
+                                          aws_http_headers_has(aws_http_message_get_headers(request->send_data.message),
+                                                             aws_s3_rdma_provider_get_rdma_token_header_name(meta_request->client->rdma_provider)));
+
+                    /* Get part info to check current checksum context state */
+                    struct aws_s3_mpu_part_info *part = NULL;
+                    aws_array_list_get_at(&auto_ranged_put->synced_data.part_list, &part, part_index);
+                    AWS_ASSERT(part != NULL);
+
+                    /* Check if server returned checksum in response headers */
+                    if (auto_ranged_put->base.checksum_config.checksum_algorithm != AWS_SCA_NONE) {
+                        struct aws_byte_cursor algorithm_header_name =
+                            aws_get_http_header_name_from_checksum_algorithm(auto_ranged_put->base.checksum_config.checksum_algorithm);
+
+                         /* Server returned checksum in response headers */
+                        struct aws_byte_cursor server_checksum;
+                        if (aws_http_headers_get(request->send_data.response_headers, algorithm_header_name, &server_checksum) == AWS_OP_SUCCESS) {
+                            /* Only update checksum context for RDMA requests if server returned checksum */
+                            if (is_rdma_request) {
+                                /* RDMA - Update part checksum context with server checksum */
+                                if (part->checksum_context) {
+                                    aws_s3_upload_request_checksum_context_release(part->checksum_context);
+                                }
+                                part->checksum_context = aws_s3_upload_request_checksum_context_new_with_existing_base64_checksum(
+                                    auto_ranged_put->base.allocator, &auto_ranged_put->base.checksum_config, server_checksum);
+
+                                if (part->checksum_context == NULL) {
+                                    AWS_LOGF_ERROR(
+                                        AWS_LS_S3_META_REQUEST,
+                                        "id=%p Failed to create checksum context for part %zu with server checksum",
+                                        (void *)meta_request,
+                                        part_number);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1825,8 +2024,18 @@ static int s_s3_auto_ranged_put_pause(
     /**
      * Cancels the meta request using the PAUSED flag to avoid deletion of uploaded parts.
      * This allows the client to resume the upload later, setting the persistable state in the meta request options.
+     *
+     * If the meta request already has a finish result set (e.g., due to RDMA error), we need to override it
+     * with AWS_ERROR_S3_PAUSED to ensure proper pause behavior.
      */
-    aws_s3_meta_request_set_fail_synced(meta_request, NULL, AWS_ERROR_S3_PAUSED);
+    if (meta_request->synced_data.finish_result_set &&
+        meta_request->synced_data.finish_result.error_code == AWS_ERROR_S3_RDMA_INVALID_TOKEN) {
+        /* Override just the error code, preserve other finish result state */
+        meta_request->synced_data.finish_result.error_code = AWS_ERROR_S3_PAUSED;
+    } else {
+        /* Normal case - set the finish result to paused */
+        aws_s3_meta_request_set_fail_synced(meta_request, NULL, AWS_ERROR_S3_PAUSED);
+    }
 
     aws_s3_meta_request_cancel_cancellable_requests_synced(meta_request, AWS_ERROR_S3_PAUSED);
     aws_s3_meta_request_cancel_pending_buffer_futures_synced(meta_request, AWS_ERROR_S3_PAUSED);

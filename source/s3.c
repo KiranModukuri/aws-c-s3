@@ -1,5 +1,6 @@
 /**
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0.
  */
 
@@ -7,6 +8,7 @@
 #include <aws/s3/private/s3_util.h>
 #include <aws/s3/s3.h>
 #include <aws/s3/s3_client.h>
+#include <aws/s3/s3_rdma_provider.h>
 
 #include <aws/auth/auth.h>
 #include <aws/checksums/checksums.h>
@@ -200,6 +202,7 @@ void aws_s3_library_init(struct aws_allocator *allocator) {
 
     aws_register_error_info(&s_error_list);
     aws_register_log_subject_info_list(&s_s3_log_subject_list);
+    aws_s3_rdma_provider_library_init(s_library_allocator);
     s_loader = aws_s3_platform_info_loader_new(allocator);
     AWS_FATAL_ASSERT(s_loader);
     s_s3_request_type_info_init(allocator);
@@ -229,6 +232,7 @@ void aws_s3_library_clean_up(void) {
 
     s_s3_request_type_info_clean_up();
     s_loader = aws_s3_platform_info_loader_release(s_loader);
+    aws_s3_rdma_provider_library_clean_up();
     aws_unregister_log_subject_info_list(&s_s3_log_subject_list);
     aws_unregister_error_info(&s_error_list);
     aws_http_library_clean_up();

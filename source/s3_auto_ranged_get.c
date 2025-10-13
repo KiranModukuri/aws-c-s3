@@ -1,5 +1,6 @@
 /**
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0.
  */
 
@@ -9,6 +10,7 @@
 #include "aws/s3/private/s3_request_messages.h"
 #include "aws/s3/private/s3_util.h"
 #include <aws/common/string.h>
+#include <aws/common/encoding.h>
 #include <inttypes.h>
 
 /* Dont use buffer pool when we know response size, and its below this number,
@@ -176,8 +178,16 @@ static enum aws_s3_auto_ranged_get_request_type s_s3_get_request_type_for_discov
 
     /* If the object_size_hint indicates that it is a small one part file, then try to get the file directly
      * TODO: Bypass memory limiter so that we don't overallocate memory for small files
+     * 
+     * Note: Skip the partNumber=1 optimization when RDMA is enabled, because:
+     * - If the object is actually multipart, server returns only the first part
+     * - RDMA requires exact size matching (allocated buffer vs actual transfer)
+     * - This causes RDMA protocol abort and 400 Bad Request
+     * - Better to use Range-based GET or HEAD+Range for RDMA
      */
-    if (auto_ranged_get->object_size_hint_available && auto_ranged_get->object_size_hint <= meta_request->part_size) {
+    if (auto_ranged_get->object_size_hint_available && 
+        auto_ranged_get->object_size_hint <= meta_request->part_size &&
+        !(meta_request->client->enable_rdma && meta_request->use_rdma)) {
         return AWS_S3_AUTO_RANGE_GET_REQUEST_TYPE_GET_OBJECT_WITH_PART_NUMBER_1;
     }
 
@@ -431,6 +441,248 @@ static bool s_s3_auto_ranged_get_update(
     return work_remaining;
 }
 
+/**
+ * Setup RDMA for GET request including user buffer mapping, buffer allocation, 
+ * registration, and token generation.
+ * 
+ * @param meta_request The meta request
+ * @param auto_ranged_get The auto ranged get implementation
+ * @param request The request to setup RDMA for
+ * @param message The HTTP message to add RDMA headers to
+ * @return AWS_OP_SUCCESS on success, AWS_OP_ERR on failure
+ */
+static int s_prepare_rdma_for_get_request(
+    struct aws_s3_meta_request *meta_request,
+    struct aws_s3_auto_ranged_get *auto_ranged_get,
+    struct aws_s3_request *request,
+    struct aws_http_message *message) {
+    
+    AWS_PRECONDITION(meta_request);
+    AWS_PRECONDITION(auto_ranged_get);
+    AWS_PRECONDITION(request);
+    AWS_PRECONDITION(message);
+
+    /* If user provided a static receive buffer, map this request's part into that buffer before RDMA setup */
+    if (meta_request->use_rdma && meta_request->user_buffer_options.transfer_buffer) {
+        void *base = meta_request->user_buffer_options.transfer_buffer;
+        size_t base_size = meta_request->user_buffer_options.transfer_buffer_size;
+
+        uint64_t part_start = request->part_range_start;
+        uint64_t part_end = request->part_range_end;
+        size_t part_size = 0;
+        uint64_t object_start = 0;
+
+        if (request->request_tag == AWS_S3_AUTO_RANGE_GET_REQUEST_TYPE_GET_OBJECT_WITH_RANGE && part_end >= part_start) {
+            part_size = (size_t)((part_end - part_start) + 1);
+            object_start = auto_ranged_get->synced_data.object_range_start;
+        } else if (request->request_tag == AWS_S3_AUTO_RANGE_GET_REQUEST_TYPE_GET_OBJECT_WITH_PART_NUMBER_1) {
+            /* For the first-part discovery request, use first_part_size if known, else part_size */
+            part_start = auto_ranged_get->synced_data.object_range_start;
+            if (auto_ranged_get->synced_data.first_part_size > 0) {
+                part_size = (size_t)auto_ranged_get->synced_data.first_part_size;
+            } else {
+                part_size = (size_t)meta_request->part_size;
+            }
+            part_end = part_start + (part_size ? (part_size - 1) : 0);
+            object_start = auto_ranged_get->synced_data.object_range_start;
+        }
+
+        if (part_size > 0) {
+            uint64_t offset_in_object = part_start - object_start;
+            if (offset_in_object <= (uint64_t)base_size && (offset_in_object + part_size) <= (uint64_t)base_size) {
+                uint8_t *ptr = (uint8_t *)base + offset_in_object;
+                request->send_data.response_body.buffer = ptr;
+                request->send_data.response_body.len = 0;
+                request->send_data.response_body.capacity = part_size;
+                request->is_user_provided_buffer = 1;  /* Mark as user buffer slice */
+                
+                AWS_LOGF_DEBUG(
+                    AWS_LS_S3_META_REQUEST,
+                    "id=%p GET Part: Using user buffer slice at offset=%llu, size=%zu",
+                    (void *)meta_request,
+                    (unsigned long long)offset_in_object,
+                    part_size);
+            } else {
+                AWS_LOGF_ERROR(
+                    AWS_LS_S3_META_REQUEST,
+                    "id=%p User buffer too small: offset=%llu size=%zu base_size=%zu",
+                    (void *)meta_request,
+                    (unsigned long long)offset_in_object,
+                    part_size,
+                    base_size);
+                /* Leave buffer unset; normal pool path will be used */
+            }
+        }
+    }
+
+    /* RDMA ENHANCEMENT: Pre-allocate response buffers and generate RDMA tokens for GET requests */
+    struct aws_s3_client *client = meta_request->client;
+    if (client && client->enable_rdma && client->rdma_provider && meta_request->use_rdma &&
+        (request->request_tag == AWS_S3_AUTO_RANGE_GET_REQUEST_TYPE_GET_OBJECT_WITH_RANGE ||
+         request->request_tag == AWS_S3_AUTO_RANGE_GET_REQUEST_TYPE_GET_OBJECT_WITH_PART_NUMBER_1)) {
+
+        /* Calculate expected response size for this GET request */
+        size_t expected_response_size = 0;
+
+        if (request->request_tag == AWS_S3_AUTO_RANGE_GET_REQUEST_TYPE_GET_OBJECT_WITH_RANGE) {
+            /* For range requests, we know the exact size from range headers */
+            if (request->part_range_end >= request->part_range_start) {
+                expected_response_size = (request->part_range_end - request->part_range_start) + 1;
+            }
+        } else if (request->request_tag == AWS_S3_AUTO_RANGE_GET_REQUEST_TYPE_GET_OBJECT_WITH_PART_NUMBER_1) {
+            /* For part number 1, use the part size (may be adjusted during object size discovery) */
+            expected_response_size = meta_request->part_size;
+        }
+
+        /* Only proceed with RDMA if the expected size meets the threshold */
+        if (expected_response_size >= client->rdma_min_transfer_size) {
+
+            /* PRE-ALLOCATE response buffer based on known size */
+            if (request->send_data.response_body.capacity == 0) {
+                /* Use buffer pool allocation if available, otherwise allocate directly */
+                if (request->should_allocate_buffer_from_pool && request->ticket != NULL) {
+                    request->send_data.response_body = aws_s3_buffer_ticket_claim(request->ticket);
+                } else {
+                    if (aws_byte_buf_init(&request->send_data.response_body, meta_request->allocator, expected_response_size)) {
+                        AWS_LOGF_ERROR(AWS_LS_S3_META_REQUEST,
+                                       "id=%p Failed to allocate response buffer for GET RDMA: size=%zu",
+                                       (void *)meta_request, expected_response_size);
+                        return AWS_OP_ERR;
+                    }
+                }
+            }
+
+            /* Check RDMA memory suitability */
+            void *response_buffer = request->send_data.response_body.buffer;
+            size_t buffer_capacity = request->send_data.response_body.capacity;
+
+            if (response_buffer && buffer_capacity > 0 &&
+                aws_s3_rdma_provider_is_memory_suitable(client->rdma_provider, response_buffer, buffer_capacity)) {
+
+                /* Register buffer with RDMA provider using buffer manager */
+                int register_result = AWS_OP_SUCCESS;
+                if (client->rdma_buffer_manager) {
+                    register_result = aws_s3_rdma_buffer_manager_prepare_buffer_for_rdma(
+                        client->rdma_buffer_manager, request, response_buffer, buffer_capacity);
+                }
+                if (register_result == AWS_OP_SUCCESS) {
+
+                    /* Generate RDMA token for GET operation */
+                    /* Extract S3 key from the HTTP message path */
+                    struct aws_byte_cursor s3_key;
+                    struct aws_byte_cursor request_path;
+
+                    if (aws_http_message_get_request_path(message, &request_path) != AWS_OP_SUCCESS) {
+                        AWS_LOGF_ERROR(AWS_LS_S3_META_REQUEST,
+                                       "id=%p Failed to get request path for RDMA token generation",
+                                       (void *)meta_request);
+                        /* Clean up on path extraction failure */
+                        if (client->rdma_buffer_manager) {
+                            aws_s3_rdma_buffer_manager_finalize_buffer(client->rdma_buffer_manager, request);
+                        }
+                        return AWS_OP_ERR;
+                    }
+
+                    /* Parse S3 key from path (format: /bucket/key or /key) */
+                    s3_key = request_path;
+                    if (s3_key.len > 0 && s3_key.ptr[0] == '/') {
+                        /* Skip leading slash */
+                        aws_byte_cursor_advance(&s3_key, 1);
+                    }
+
+                    /* For bucket/key format, find the key after the first slash */
+                    struct aws_byte_cursor temp_cursor = s3_key;
+                    struct aws_byte_cursor bucket_part;
+                    if (aws_byte_cursor_next_split(&temp_cursor, '/', &bucket_part) && temp_cursor.len > 0) {
+                        /* Found bucket/key format, use the part after bucket */
+                        s3_key = temp_cursor;
+                    }
+
+                    /* Remove query parameters if present */
+                    struct aws_byte_cursor key_without_query = s3_key;
+                    struct aws_byte_cursor query_part;
+                    if (aws_byte_cursor_next_split(&key_without_query, '?', &query_part)) {
+                        s3_key = query_part; /* First part before '?' */
+                    }
+
+                    struct aws_byte_cursor rdma_token_cursor;
+
+                    int rdma_result = aws_s3_rdma_provider_prepare_get_token(
+                        client->rdma_provider, &s3_key, response_buffer, buffer_capacity, 0, &rdma_token_cursor);
+
+                    if (rdma_result == AWS_OP_SUCCESS) {
+                        /* Add RDMA token header to GET request */
+                        struct aws_http_headers *headers = aws_http_message_get_headers(message);
+                        if (headers) {
+                            struct aws_byte_cursor header_name = aws_s3_rdma_provider_get_rdma_token_header_name(client->rdma_provider);
+
+                            /* Use the RDMA token directly (plugin now generates correct length) */
+                            struct aws_byte_cursor header_value = rdma_token_cursor;
+
+                            if (aws_http_headers_set(headers, header_name, header_value) != AWS_OP_SUCCESS) {
+                                AWS_LOGF_WARN(
+                                    AWS_LS_S3_META_REQUEST,
+                                    "id=%p Failed to add GET RDMA token header for request %p",
+                                    (void *)meta_request,
+                                    (void *)request);
+
+                                /* Clean up on header failure */
+                                if (client->rdma_buffer_manager) {
+                                    aws_s3_rdma_buffer_manager_finalize_buffer(client->rdma_buffer_manager, request);
+                                }
+                            }
+                        } else {
+                            AWS_LOGF_WARN(AWS_LS_S3_META_REQUEST,
+                                          "id=%p No headers found in GET request message", (void *)meta_request);
+                        }
+                    } else {
+                        AWS_LOGF_WARN(
+                            AWS_LS_S3_META_REQUEST,
+                            "id=%p Failed to generate GET RDMA token for request %p (result=%d)",
+                            (void *)meta_request,
+                            (void *)request,
+                            rdma_result);
+
+                        /* Clean up on token generation failure */
+                        if (client->rdma_buffer_manager) {
+                            aws_s3_rdma_buffer_manager_finalize_buffer(client->rdma_buffer_manager, request);
+                        }
+                    }
+                } else {
+                    AWS_LOGF_ERROR(
+                        AWS_LS_S3_META_REQUEST,
+                        "id=%p Failed to register GET response buffer with RDMA provider (result=%d). Buffer details: ptr=%p, size=%zu, alignment=0x%lx, RDMA provider=%p. Falling back to HTTP transfer.",
+                        (void *)meta_request,
+                        register_result,
+                        response_buffer,
+                        buffer_capacity,
+                        (unsigned long)response_buffer % 4096,  /* Check 4K alignment */
+                        (void *)client->rdma_provider);
+
+                    /* Check if buffer meets basic requirements */
+                    bool is_null = (response_buffer == NULL);
+                    bool is_zero_size = (buffer_capacity == 0);
+                    bool below_threshold = (buffer_capacity < client->rdma_min_transfer_size);
+
+                    AWS_LOGF_ERROR(
+                        AWS_LS_S3_META_REQUEST,
+                        "id=%p RDMA registration failure analysis: buffer_null=%d, zero_size=%d, below_threshold=%d (threshold=%zu)",
+                        (void *)meta_request,
+                        is_null, is_zero_size, below_threshold,
+                        client->rdma_min_transfer_size);
+
+                    /* Mark request to disable RDMA on retry if this fails */
+                    request->disable_rdma_on_retry = 1;
+
+                    /* Continue without RDMA - request will use standard HTTP transfer */
+                }
+            }
+        }
+    }
+
+    return AWS_OP_SUCCESS;
+}
+
 /* Given a request, prepare it for sending based on its description.
  * Currently, this is actually synchronous. */
 static struct aws_future_void *s_s3_auto_ranged_get_prepare_request(struct aws_s3_request *request) {
@@ -495,8 +747,14 @@ static struct aws_future_void *s_s3_auto_ranged_get_prepare_request(struct aws_s
     }
 
     aws_s3_request_setup_send_data(request, message);
-    aws_http_message_release(message);
 
+    /* Setup RDMA for GET request if applicable */
+    int rdma_setup_result = s_prepare_rdma_for_get_request(meta_request, auto_ranged_get, request, message);
+    aws_http_message_release(message);
+    if (rdma_setup_result != AWS_OP_SUCCESS) {
+        goto finish;
+    }
+    
     /* Success! */
     AWS_LOGF_DEBUG(
         AWS_LS_S3_META_REQUEST,
@@ -861,6 +1119,21 @@ update_synced_data:
                     auto_ranged_get->synced_data.first_part_size,
                     object_range_start,
                     object_range_end);
+            }
+            
+            /* Validate user buffer size if provided */
+            if (meta_request->user_buffer_options.transfer_buffer != NULL && 
+                meta_request->user_buffer_options.transfer_buffer_size > 0) {
+                uint64_t required_size = object_size ? (object_range_end - object_range_start + 1) : 0;
+                if (required_size > meta_request->user_buffer_options.transfer_buffer_size) {
+                    AWS_LOGF_ERROR(
+                        AWS_LS_S3_META_REQUEST,
+                        "id=%p User buffer too small for GET object. Required: %" PRIu64 " bytes, Provided: %zu bytes",
+                        (void *)meta_request,
+                        required_size,
+                        meta_request->user_buffer_options.transfer_buffer_size);
+                    error_code = aws_raise_error(AWS_ERROR_S3_INVALID_RESPONSE_STATUS);
+                }
             }
         }
 

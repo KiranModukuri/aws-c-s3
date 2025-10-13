@@ -175,6 +175,14 @@ static void s_s3_request_destroy(void *user_data) {
         return;
     }
 
+    /* Deregister RDMA buffer if we registered it for this request */
+    if (request->rdma_buffer_registered) {
+        struct aws_s3_client *client = request->meta_request ? request->meta_request->client : NULL;
+        if (client && client->rdma_buffer_manager) {
+            aws_s3_rdma_buffer_manager_finalize_buffer(client->rdma_buffer_manager, request);
+        }
+    }
+
     aws_s3_request_clean_up_send_data(request);
     aws_byte_buf_clean_up(&request->request_body);
     aws_s3_buffer_ticket_release(request->ticket);

@@ -439,6 +439,10 @@ struct aws_http_message *aws_s3_upload_part_message_new(
         goto error_clean_up;
     }
 
+    /* For RDMA requests, skip HTTP body assignment */
+    if (buffer == NULL) {
+        return message;
+    }
     if (aws_s3_message_util_assign_body(allocator, buffer, NULL /*body_stream*/, message, checksum_context) == NULL) {
         goto error_clean_up;
     }

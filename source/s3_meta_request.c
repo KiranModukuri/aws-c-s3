@@ -1,5 +1,6 @@
 /**
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0.
  */
 
@@ -361,6 +362,28 @@ int aws_s3_meta_request_init_base(
 
     } else if (options->send_using_async_writes == true) {
         meta_request->request_body_using_async_writes = true;
+    }
+
+    /* Store RDMA usage preference */
+    const char *env_force_rdma = getenv("AWS_S3_FORCE_RDMA");
+    if (env_force_rdma) {
+            if (strcmp(env_force_rdma, "true") == 0 || strcmp(env_force_rdma, "1") == 0) {
+                    AWS_LOGF_TRACE(AWS_LS_S3_CLIENT, "id=%p forcing from environment: true", (void *)client);
+                    meta_request->use_rdma = true;
+            }
+    } else {
+        meta_request->use_rdma = options->use_rdma;
+    }
+
+    /* Store user buffer options if provided */
+    if (options->user_buffer_options) {
+        meta_request->user_buffer_options = *options->user_buffer_options;
+        if(meta_request->user_buffer_options.transfer_buffer_size < client->rdma_min_transfer_size) {
+                meta_request->use_rdma = false;
+        }
+    }
+    else {
+        AWS_ZERO_STRUCT(meta_request->user_buffer_options);
     }
 
     meta_request->synced_data.next_streaming_part = 1;
@@ -795,6 +818,20 @@ static void s_s3_meta_request_on_request_prepared(void *user_data) {
 
     aws_s3_add_user_agent_header(meta_request->allocator, request->send_data.message);
 
+    /* Add RDMA token headers if RDMA is enabled and suitable for this request */
+    struct aws_s3_client *client = meta_request->client;
+    if (client && client->rdma_request_handler) {
+        int rdma_result = aws_s3_rdma_request_handler_prepare_request(client->rdma_request_handler, meta_request, request);
+        if (rdma_result != AWS_OP_SUCCESS) {
+            AWS_LOGF_ERROR(
+                AWS_LS_S3_META_REQUEST,
+                "id=%p RDMA preparation failed, aborting request to trigger retry with HTTP",
+                (void *)meta_request);
+            s_s3_prepare_request_payload_callback_and_destroy(payload, rdma_result);
+            return;
+        }
+    }
+
     /* Next step is to sign the newly created message (completion callback could happen on any thread) */
     s_s3_meta_request_sign_request(meta_request, request, s_s3_meta_request_request_on_signed, payload);
 }
@@ -954,8 +991,12 @@ static void s_meta_request_resolve_signing_config(
     }
 
     /* If the checksum is configured to be added to the trailer, the payload will be aws-chunked encoded. The
-     * payload will need to be streaming signed/unsigned. */
+     * payload will need to be streaming signed/unsigned.
+     * for RDMA don't use STREAMING-UNSIGNED-PAYLOAD-TRAILER 
+     * Note: rdma_buffer_registered is cleared before signing if RDMA won't actually be used,
+     * so this check correctly reflects whether RDMA will be used. */
     if (meta_request->checksum_config.location == AWS_SCL_TRAILER &&
+        !request->rdma_buffer_registered &&
         aws_byte_cursor_eq(&out_signing_config->signed_body_value, &g_aws_signed_body_value_unsigned_payload)) {
         out_signing_config->signed_body_value = g_aws_signed_body_value_streaming_unsigned_payload_trailer;
     }
@@ -1120,8 +1161,11 @@ static void s_s3_meta_request_request_on_signed(
 
     /**
      * Add "x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER" header to support trailing checksum.
+     * RDMA uses out-of-band data transfer and doesn't support
+     * chunked encoding or streaming payload.
      */
-    if (request->send_data.require_streaming_unsigned_payload_header) {
+    if (request->send_data.require_streaming_unsigned_payload_header &&
+        !request->rdma_buffer_registered) {
         struct aws_http_headers *headers = aws_http_message_get_headers(request->send_data.message);
         AWS_ASSERT(headers != NULL);
         if (aws_http_headers_set(
@@ -1389,6 +1433,16 @@ static int s_s3_meta_request_incoming_headers(
         }
     }
 
+    /* Process RDMA-specific response headers if client attempted RDMA (buffer was registered and token sent) */
+    if (request->rdma_buffer_registered) {
+        struct aws_s3_client *client = meta_request->client;
+        int rdma_result = aws_s3_rdma_request_handler_process_response_headers(
+            client->rdma_request_handler, meta_request, request, headers, headers_count);
+        if (rdma_result != AWS_OP_SUCCESS) {
+            return rdma_result;
+        }
+    }
+
     return AWS_OP_SUCCESS;
 }
 
@@ -1411,6 +1465,27 @@ static int s_s3_meta_request_headers_block_done(
     struct aws_s3_meta_request *meta_request = request->meta_request;
     AWS_PRECONDITION(meta_request);
 
+   /* Validate content size using RDMA handler if this is an RDMA GET request */
+    if (request->rdma_buffer_registered &&  
+        (request->send_data.response_status == AWS_HTTP_STATUS_CODE_200_OK || 
+        request->send_data.response_status == AWS_HTTP_STATUS_CODE_206_PARTIAL_CONTENT ||
+        request->send_data.response_status == AWS_HTTP_STATUS_CODE_204_NO_CONTENT) &&
+        (request->request_type == AWS_S3_REQUEST_TYPE_GET_OBJECT ||
+        request->request_tag == AWS_S3_AUTO_RANGE_GET_REQUEST_TYPE_GET_OBJECT_WITH_PART_NUMBER_1)) {
+        struct aws_s3_client *client = meta_request->client;
+        int validation_result = aws_s3_rdma_request_handler_validate_content_size(
+            client->rdma_request_handler, meta_request, request);
+        if (validation_result != AWS_OP_SUCCESS) {
+            AWS_LOGF_ERROR(
+                AWS_LS_S3_META_REQUEST,
+                "id=%p RDMA content size validation FAILED with error %d (%s) - REQUEST WILL BE ABORTED",
+                (void *)meta_request,
+                aws_last_error(),
+                aws_error_str(aws_last_error()));
+        }
+        return validation_result;
+    }
+
     /*
      * When downloading parts via partNumber, if the size is larger than expected, cancel the request immediately so
      * we don't end up downloading more into memory than we can handle. We'll retry the download using ranged gets
@@ -1422,7 +1497,7 @@ static int s_s3_meta_request_headers_block_done(
         if (!aws_s3_parse_content_length_response_header(
                 request->allocator, request->send_data.response_headers, &content_length) &&
             content_length > meta_request->part_size) {
-            return aws_raise_error(AWS_ERROR_S3_INTERNAL_PART_SIZE_MISMATCH_RETRYING_WITH_RANGE);
+           return aws_raise_error(AWS_ERROR_S3_INTERNAL_PART_SIZE_MISMATCH_RETRYING_WITH_RANGE);
         }
     }
     return AWS_OP_SUCCESS;
@@ -1464,6 +1539,18 @@ static int s_s3_meta_request_incoming_body(
         s_s3_meta_request_error_code_from_response_status(request->send_data.response_status) == AWS_ERROR_SUCCESS;
     if (!successful_response) {
         AWS_LOGF_TRACE(AWS_LS_S3_META_REQUEST, "response body: \n" PRInSTR "\n", AWS_BYTE_CURSOR_PRI(*data));
+    }
+    /* Process response body based on whether server used RDMA or HTTP
+     * If server fell back to HTTP, process as normal HTTP body. */
+    bool rdma_transfer_completed = (request->rdma_buffer_registered && 
+                                    request->request_type == AWS_S3_REQUEST_TYPE_GET_OBJECT &&
+                                    request->rdma_transfer_succeeded);
+    
+    if (rdma_transfer_completed && successful_response) {
+        if( data->len ==0)
+            return AWS_OP_SUCCESS;
+        else
+            return AWS_OP_ERR;
     }
 
     if (meta_request->checksum_config.validate_response_checksum && request->request_level_running_response_sum) {
@@ -1871,6 +1958,17 @@ void aws_s3_meta_request_cancel_cancellable_requests_synced(struct aws_s3_meta_r
             AWS_CONTAINER_OF(request_node, struct aws_s3_request, cancellable_http_streams_list_node);
         AWS_ASSERT(!request->always_send);
 
+        AWS_LOGF_ERROR(
+            AWS_LS_S3_META_REQUEST,
+            "id=%p CANCELLING HTTP STREAM for request %p (type=%d, part=%u, rdma_registered=%d) with error %d (%s)",
+            (void *)meta_request,
+            (void *)request,
+            request->request_type,
+            request->part_number,
+            request->rdma_buffer_registered,
+            error_code,
+            aws_error_str(error_code));
+        
         aws_http_stream_cancel(request->synced_data.cancellable_http_stream, error_code);
         request->synced_data.cancellable_http_stream = NULL;
     }

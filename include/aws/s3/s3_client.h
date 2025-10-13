@@ -658,6 +658,29 @@ struct aws_s3_client_config {
 
     /* User data thats passed into pool factory. */
     void *buffer_pool_user_data;
+    /**
+     * Optional.
+     * RDMA provider plugin path for accelerated transfers.
+     * If set, the client will attempt to load the RDMA provider plugin from this path.
+     * The plugin should implement the aws_s3_rdma_provider interface.
+     */
+    struct aws_byte_cursor rdma_provider_plugin_path;
+
+    /**
+     * Optional.
+     * Minimum transfer size in bytes to consider using RDMA acceleration.
+     * Transfers smaller than this threshold will use standard HTTP transfers.
+     * Defaults to 1MB if not specified.
+     */
+    size_t rdma_min_transfer_size;
+
+    /**
+     * Optional.
+     * Enable RDMA acceleration for S3 transfers.
+     * If true and rdma_provider_plugin_path is set, the client will attempt to use RDMA
+     * for eligible transfers (GET/PUT operations above rdma_min_transfer_size).
+     */
+    bool enable_rdma;
 };
 
 struct aws_s3_checksum_config {
@@ -863,6 +886,21 @@ struct aws_s3_meta_request_options {
     bool send_using_async_writes;
 
     /**
+     * Optional - EXPERIMENTAL
+     * Extension structure for RDMA user-provided buffers. This maintains ABI compatibility.
+     * Set to NULL if not using user-provided buffers.
+     */
+    const struct aws_s3_user_buffer_options *user_buffer_options;
+
+    /**
+     * Optional.
+     * If true, the library will attempt to use RDMA internally for this meta-request when eligible,
+     * handling memory suitability/registration, token creation, header injection, and (for PUT) body stripping.
+     * If false (default), the library will not attempt internal RDMA for this meta-request.
+     */
+    bool use_rdma;
+
+    /**
      * Optional.
      * if set, the flexible checksum will be performed by client based on the config.
      *
@@ -994,6 +1032,20 @@ struct aws_s3_meta_request_options {
      * This will be ignored for other operations.
      */
     struct aws_byte_cursor copy_source_uri;
+};
+
+/* EXPERIMENTAL - User-provided buffer options for GET/PUT operations */
+struct aws_s3_user_buffer_options {
+    /* Unified transfer buffer: PUT reads from it; GET writes into it. */
+    void *transfer_buffer;
+    size_t transfer_buffer_size;
+
+    /* Whether the buffer is already registered/pinned at the system level (OS/driver).
+     * Note: Even if true, the library will still register each slice (offset + size) with the
+     * RDMA provider for token generation. This flag is a hint that the underlying memory
+     * is already pinned and suitable for RDMA transfers. */
+    bool buffer_is_rdma_registered;
+    void *_reserved[4];
 };
 
 /* Result details of a meta request.

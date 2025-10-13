@@ -1,3 +1,8 @@
+/**
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0.
+ */
 #include "aws/s3/private/s3_default_meta_request.h"
 #include "aws/s3/private/s3_checksum_context.h"
 #include "aws/s3/private/s3_client_impl.h"
@@ -276,7 +281,34 @@ static struct aws_future_void *s_s3_default_prepare_request(struct aws_s3_reques
     request_prep->request = request;
     request_prep->on_complete = aws_future_void_acquire(asyncstep_prepare_request);
 
-    if (meta_request_default->content_length > 0 && request->num_times_prepared == 0) {
+    /* If RDMA is enabled for a single-request PUT with user buffer options,
+     * avoid body-read by zeroing content_length.
+     */
+    bool rdma_only_put = false;
+    if (meta_request->use_rdma  && meta_request->user_buffer_options.transfer_buffer) {
+        if (meta_request_default->request_type == AWS_S3_REQUEST_TYPE_PUT_OBJECT) {
+               rdma_only_put = true;
+               meta_request_default->content_length = 0;
+               
+               /* Populate request body with user buffer (zero-copy)
+                * DO NOT set allocator - this signals cleanup to not free the buffer */
+               request->request_body.buffer = meta_request->user_buffer_options.transfer_buffer;
+               request->request_body.len = meta_request->user_buffer_options.transfer_buffer_size;
+               request->request_body.capacity = meta_request->user_buffer_options.transfer_buffer_size;
+               request->is_user_provided_buffer = 1;  /* Mark to skip read step */
+        }
+        /* For RDMA GET with user buffer options (single-request GET),
+        * pre-map user buffer so RDMA token logic can detect it
+        */
+        if (meta_request_default->request_type == AWS_S3_REQUEST_TYPE_GET_OBJECT) {
+            request->send_data.response_body.buffer = meta_request->user_buffer_options.transfer_buffer;
+            request->send_data.response_body.len = 0;
+            request->send_data.response_body.capacity = meta_request->user_buffer_options.transfer_buffer_size;
+        /* Note: rdma_buffer_registered will be set during buffer registration */
+        }
+    }
+
+    if (meta_request_default->content_length > 0 && request->num_times_prepared == 0 && !rdma_only_put) {
         aws_byte_buf_init(&request->request_body, meta_request->allocator, meta_request_default->content_length);
 
         /* Kick off the async read */
@@ -340,8 +372,23 @@ static void s_s3_default_prepare_request_finish(
     struct aws_http_message *message = aws_s3_message_util_copy_http_message_no_body_all_headers(
         meta_request->allocator, meta_request->initial_request_message);
 
+    /* Determine if this will be an RDMA request to decide on Content-MD5.
+     * By this point, request_body.len is always correct:
+     * - User buffers: len was set when buffer was provided
+     * - File-based: len was set after file read completed
+     * - Empty files: len = 0 (skip RDMA) */
+    struct aws_s3_client *client = meta_request->client;
+    bool will_use_rdma = client->enable_rdma &&
+                         meta_request->use_rdma &&
+                         !request->disable_rdma_on_retry &&
+                         request->request_body.buffer != NULL &&
+                         request->request_body.len > 0 &&
+                         request->request_body.len >= client->rdma_min_transfer_size;
+
     bool flexible_checksum = meta_request->checksum_config.location != AWS_SCL_NONE;
-    if (!flexible_checksum && meta_request->should_compute_content_md5) {
+    /* Skip Content-MD5 for RDMA requests since HTTP body will be empty.
+     * Content-MD5 applies to HTTP body, not RDMA data. */
+    if (!flexible_checksum && meta_request->should_compute_content_md5 && !will_use_rdma) {
         /* If flexible checksum used, client MUST skip Content-MD5 header computation */
         aws_s3_message_util_add_content_md5_header(meta_request->allocator, &request->request_body, message);
     }
@@ -358,8 +405,30 @@ static void s_s3_default_prepare_request_finish(
         struct aws_s3_upload_request_checksum_context *checksum_context =
             aws_s3_upload_request_checksum_context_new(meta_request->allocator, &meta_request->checksum_config);
 
-        aws_s3_message_util_assign_body(
-            meta_request->allocator, &request->request_body, NULL, message, checksum_context);
+        /* For RDMA requests: Skip HTTP body assignment - keep request_body intact for RDMA operations and retry fallback.*/
+
+        AWS_LOGF_DEBUG(
+            AWS_LS_S3_META_REQUEST,
+            "id=%p RDMA decision for PUT: will_use=%d (size=%zu, threshold=%zu)",
+            (void *)meta_request,
+            will_use_rdma,
+            request->request_body.len,
+            client->rdma_min_transfer_size);
+
+        /* If buffer was pre-registered but RDMA eligibility check failed, deregister it
+         * so signing will correctly use STREAMING-UNSIGNED-PAYLOAD-TRAILER */
+        if (!will_use_rdma && request->rdma_buffer_registered && client->rdma_buffer_manager) {
+            AWS_LOGF_DEBUG(
+                AWS_LS_S3_META_REQUEST,
+                "id=%p Buffer pre-registered but RDMA not eligible - deregistering",
+                (void *)meta_request);
+            aws_s3_rdma_buffer_manager_finalize_buffer(client->rdma_buffer_manager, request);
+            request->rdma_buffer_registered = 0;
+        }
+
+        if (!will_use_rdma) {
+            aws_s3_message_util_assign_body(meta_request->allocator, &request->request_body, NULL, message, checksum_context);
+        }
 
         /* Release the context reference */
         aws_s3_upload_request_checksum_context_release(checksum_context);
@@ -441,8 +510,29 @@ static void s_s3_meta_request_default_request_finished(
                     event.u.progress.info.content_length = request->request_body.len;
                 } else {
                     /* For anything else, report response body size */
-                    event.u.progress.info.bytes_transferred = request->send_data.response_body.len;
-                    event.u.progress.info.content_length = request->send_data.response_body.len;
+                    /* For RDMA GET requests, use actual content length from response headers
+                     * instead of response body length because RDMA transfers data directly to user buffer,
+                     * bypassing HTTP response body. The RDMA bytes header value gets converted to Content-Length. */
+                    if (request->rdma_buffer_registered && request->send_data.response_headers) {
+                        struct aws_byte_cursor content_length_cursor;
+                        AWS_ZERO_STRUCT(content_length_cursor);
+                        uint64_t rdma_content_length = 0;
+                        
+                        if (aws_http_headers_get(request->send_data.response_headers, 
+                                               aws_byte_cursor_from_c_str("Content-Length"), 
+                                               &content_length_cursor) == AWS_OP_SUCCESS &&
+                            aws_byte_cursor_utf8_parse_u64(content_length_cursor, &rdma_content_length) == AWS_OP_SUCCESS) {
+                            event.u.progress.info.bytes_transferred = rdma_content_length;
+                            event.u.progress.info.content_length = rdma_content_length;
+                        } else {
+                            /* Fallback to response body length if header parsing fails */
+                            event.u.progress.info.bytes_transferred = request->send_data.response_body.len;
+                            event.u.progress.info.content_length = request->send_data.response_body.len;
+                        }
+                    } else {
+                        event.u.progress.info.bytes_transferred = request->send_data.response_body.len;
+                        event.u.progress.info.content_length = request->send_data.response_body.len;
+                    }
                 }
                 aws_s3_meta_request_add_event_for_delivery_synced(meta_request, &event);
             }

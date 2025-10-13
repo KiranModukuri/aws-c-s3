@@ -18,6 +18,7 @@
 #include <aws/http/connection.h>
 #include <aws/http/connection_manager.h>
 #include <aws/http/proxy.h>
+#include <aws/s3/s3_rdma_provider.h>
 
 /* TODO automate this value in the future to prevent it from becoming out-of-sync. */
 #define AWS_S3_CLIENT_VERSION "0.1.x"
@@ -345,6 +346,21 @@ struct aws_s3_client {
      */
     struct aws_byte_cursor *network_interface_names_cursor_array;
     size_t num_network_interface_names;
+
+    /* RDMA provider for accelerated transfers. */
+    struct aws_s3_rdma_provider *rdma_provider;
+
+    /* RDMA request handler for processing RDMA operations. */
+    struct aws_s3_rdma_request_handler *rdma_request_handler;
+
+    /* RDMA buffer manager for managing buffer lifecycle. */
+    struct aws_s3_rdma_buffer_manager *rdma_buffer_manager;
+
+    /* Minimum transfer size to consider using RDMA acceleration. */
+    const size_t rdma_min_transfer_size;
+
+    /* Whether RDMA acceleration is enabled. */
+    const bool enable_rdma;
 
     struct {
         /* Number of overall requests currently being processed by the client. */
