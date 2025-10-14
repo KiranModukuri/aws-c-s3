@@ -2,6 +2,9 @@
 
 The AWS-C-S3 library is an asynchronous AWS S3 client focused on maximizing throughput and network utilization.
 
+> ** RDMA Support**: This repository includes NVIDIA cuObject RDMA plugin support for GPU-direct S3 transfers.  
+> For building with RDMA support, see **[INSTALL.md](INSTALL.md)** for detailed instructions.
+
 ### Key features:
 - **Automatic Request Splitting**: Improves throughput by automatically splitting the request into part-sized chunks and performing parallel uploads/downloads of these chunks over multiple connections. There's a cap on the throughput of single S3 connection, the only way to go faster is multiple parallel connections.
 - **Automatic Retries**: Increases resilience by retrying individual failed chunks of a file transfer, eliminating the need to restart transfers from scratch after an intermittent error.

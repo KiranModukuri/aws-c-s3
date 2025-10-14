@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Environment configuration template for RDMA tests
+# 
+# Usage:
+#   1. Copy this file: cp env_rdma.sh.template env_rdma.sh
+#   2. Edit env_rdma.sh with your local paths
+#   3. Source it: source scripts/env_rdma.sh
+
+# =============================================================================
+# REQUIRED: Repository Configuration
+# =============================================================================
+
+# Get repository root from script location if not already set
+if [ -z "${REPO_ROOT:-}" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    export REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+
+# =============================================================================
+# REQUIRED FOR RDMA: cuObject Configuration
+# =============================================================================
+
+# Path to cuObject installation directory
+# Set this to your cuObject installation location
+export CUOBJECT_ROOT_DIR=${CUOBJECT_ROOT_DIR:-""}
+
+# If CUOBJECT_ROOT_DIR is set, derive other cuObject paths
+if [ -n "$CUOBJECT_ROOT_DIR" ]; then
+    export CUOBJECT_LIB_DIR=${CUOBJECT_LIB_DIR:-"$CUOBJECT_ROOT_DIR/build/lib_src"}
+    export CUFILE_LIB_DIR=${CUFILE_LIB_DIR:-"$CUOBJECT_ROOT_DIR/lib/cufile"}
+    export CUFILE_RDMA_LIB_DIR=${CUFILE_RDMA_LIB_DIR:-"$CUOBJECT_ROOT_DIR/lib/mlx"}
+    export CUFILE_INCLUDE_DIR=${CUFILE_INCLUDE_DIR:-"$CUOBJECT_ROOT_DIR/lib/cufile"}
+    export CUFILE_ENV_PATH_JSON=${CUFILE_ENV_PATH_JSON:-"$CUOBJECT_ROOT_DIR/cuobj.json"}
+fi
+
+# =============================================================================
+# Build Configuration
+# =============================================================================
+
+export PLUGIN_DIR="$REPO_ROOT/plugins/cuobject"
+export PLUGIN_BUILD_DIR="$PLUGIN_DIR/build"
+export CRT_PREFIX="$REPO_ROOT/local-install"
+
+# =============================================================================
+# AWS Credentials (Optional - for testing)
+# =============================================================================
+
+# Set these for testing against AWS S3 or compatible services
+export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-"admin"}
+export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-"admin"}
+export AWS_REGION=${AWS_REGION:-"us-east-1"}
+export AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-"us-east-1"}
+
+# =============================================================================
+# Test Endpoint Configuration
+# =============================================================================
+
+# S3 test endpoint (for local MinIO or other S3-compatible services)
+export CRT_S3_TEST_ENDPOINT=${CRT_S3_TEST_ENDPOINT:-"127.0.0.1:9000"}
+export CRT_S3_TEST_BUCKET_NAME=${CRT_S3_TEST_BUCKET_NAME:-"aws-c-s3-test-bucket"}
+export S3_HTTP_ENDPOINT=${S3_HTTP_ENDPOINT:-"http://127.0.0.1:9000"}
+
+# Skip checksum validation for local endpoints (MinIO doesn't return checksums on GET)
+export CRT_S3_TEST_SKIP_CKSUM_VALIDATE=1
+
+# =============================================================================
+# RDMA Runtime Configuration
+# =============================================================================
+
+# Validate and display cuFile configuration
+if [ -n "${CUFILE_ENV_PATH_JSON:-}" ]; then
+    if [ ! -f "$CUFILE_ENV_PATH_JSON" ]; then
+        echo "[env_rdma] WARNING: CUFILE_ENV_PATH_JSON points to missing file: $CUFILE_ENV_PATH_JSON" >&2
+        echo "[env_rdma]          RDMA provider may not initialize correctly." >&2
+    else
+        echo "[env_rdma] Using CUFILE_ENV_PATH_JSON=$CUFILE_ENV_PATH_JSON"
+    fi
+elif [ -n "$CUOBJECT_ROOT_DIR" ]; then
+    echo "[env_rdma] WARNING: CUFILE_ENV_PATH_JSON is not set. RDMA provider may not initialize." >&2
+fi
+
+# CMake and build paths
+export CMAKE_PREFIX_PATH="$CRT_PREFIX"
+export PATH="$CRT_PREFIX/bin:$PATH"
+
+# Runtime library paths
+export LD_LIBRARY_PATH="$CRT_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+
+# RDMA plugin path
+export AWS_S3_RDMA_PLUGIN_PATH="$PLUGIN_BUILD_DIR/libcuobject_s3_plugin.so"
+
+# Force standard S3 requests to use RDMA path
+export AWS_S3_FORCE_RDMA=${AWS_S3_FORCE_RDMA:-1}
+
+# RDMA threshold: minimum object size (in bytes) to use RDMA transfer
+# Set lower for testing small objects via RDMA
+export AWS_S3_RDMA_THRESHOLD_BYTES=${AWS_S3_RDMA_THRESHOLD_BYTES:-1048576}
+
+# Set LD_PRELOAD for cuFile + RDMA libraries if they exist
+if [ -n "${CUFILE_LIB_DIR:-}" ] && [ -d "$CUFILE_LIB_DIR" ]; then
+    # Try to find cufile library with version
+    CUFILE_LIB=$(find "$CUFILE_LIB_DIR" -maxdepth 1 -name "libcufile.so*" -type f 2>/dev/null | head -1)
+    CUFILE_RDMA_LIB=""
+    if [ -n "${CUFILE_RDMA_LIB_DIR:-}" ] && [ -d "$CUFILE_RDMA_LIB_DIR" ]; then
+        CUFILE_RDMA_LIB=$(find "$CUFILE_RDMA_LIB_DIR" -maxdepth 1 -name "libcufile_rdma.so*" -type f 2>/dev/null | head -1)
+    fi
+    
+    if [ -n "$CUFILE_LIB" ] && [ -n "$CUFILE_RDMA_LIB" ]; then
+        export LD_PRELOAD="$CUFILE_LIB $CUFILE_RDMA_LIB"
+        echo "[env_rdma] LD_PRELOAD set for cuFile libraries"
+    elif [ -n "$CUFILE_LIB" ]; then
+        export LD_PRELOAD="$CUFILE_LIB"
+        echo "[env_rdma] LD_PRELOAD set for cuFile library (RDMA library not found)"
+    fi
+fi
+
+# =============================================================================
+# Display Configuration Summary
+# =============================================================================
+
+echo "[env_rdma] Environment configured:"
+echo "[env_rdma]   REPO_ROOT: $REPO_ROOT"
+echo "[env_rdma]   CRT_PREFIX: $CRT_PREFIX"
+if [ -n "$CUOBJECT_ROOT_DIR" ]; then
+    echo "[env_rdma]   CUOBJECT_ROOT_DIR: $CUOBJECT_ROOT_DIR"
+    echo "[env_rdma]   RDMA Support: ENABLED"
+else
+    echo "[env_rdma]   CUOBJECT_ROOT_DIR: <not set>"
+    echo "[env_rdma]   RDMA Support: DISABLED (will build mock plugin)"
+fi
+
