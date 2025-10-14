@@ -63,6 +63,7 @@ const struct aws_byte_cursor g_pre_existing_object_async_error_xml =
 
 const struct aws_byte_cursor g_put_object_prefix = AWS_BYTE_CUR_INIT_FROM_STRING_LITERAL("/upload/put-object-test");
 const struct aws_byte_cursor g_upload_folder = AWS_BYTE_CUR_INIT_FROM_STRING_LITERAL("/upload");
+struct aws_byte_cursor g_test_endpoint = {.ptr = NULL, .len = 0};
 
 /* If `$CRT_S3_TEST_BUCKET_NAME` environment variable is set, use that; otherwise, use aws-c-s3-test-bucket */
 struct aws_byte_cursor g_test_bucket_name = AWS_BYTE_CUR_INIT_FROM_STRING_LITERAL("aws-c-s3-test-bucket");
@@ -340,10 +341,66 @@ static bool s_s3_tester_have_meta_requests_finished(void *user_data);
 
 static bool s_s3_tester_has_client_shutdown(void *user_data);
 
+/* Helper function to determine if we're using local endpoint or AWS S3 
+ * Local endpoints are identified by IP:port format (e.g., 127.0.0.1:9000 or 192.168.1.12:80)
+ * AWS S3 endpoints are domain names (e.g., s3.amazonaws.com)
+ */
+bool aws_s3_tester_is_using_local_endpoint(void) {
+    /* Check for IP:port pattern - look for digits/dots followed by colon and port */
+    bool has_colon = false;
+    bool has_digit_before_colon = false;
+
+    for (size_t i = 0; i < g_test_endpoint.len; i++) {
+        char c = g_test_endpoint.ptr[i];
+
+        if (c == ':') {
+            has_colon = true;
+            /* Check if there's at least one digit or dot before the colon (indicates IP) */
+            for (size_t j = 0; j < i; j++) {
+                char prev = g_test_endpoint.ptr[j];
+                if ((prev >= '0' && prev <= '9') || prev == '.') {
+                    has_digit_before_colon = true;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+
+    /* If it has colon with digits/dots before it, it's IP:port format (local endpoint) */
+    /* Otherwise it's a domain name (AWS S3 or other cloud endpoint) */
+    return has_colon && has_digit_before_colon;
+}
+
+/* Check if CRT_S3_TEST_SKIP_CKSUM_VALIDATE environment variable is set */
+bool aws_s3_tester_should_skip_checksum_validate(void) {
+    static bool cached_result = false;
+    static bool is_cached = false;
+
+    if (is_cached) {
+        return cached_result;
+    }
+
+    /* Check environment variable */
+    const char *env_value = getenv(CRT_S3_TEST_SKIP_CKSUM_VALIDATE_ENV_VAR);
+    cached_result = (env_value != NULL && strlen(env_value) > 0);
+    is_cached = true;
+
+    return cached_result;
+}
+
 struct aws_string *aws_s3_tester_build_endpoint_string(
     struct aws_allocator *allocator,
     const struct aws_byte_cursor *bucket_name,
     const struct aws_byte_cursor *region) {
+ 
+    /* Simply return the configured endpoint.
+     * The S3 client will handle path-style vs virtual-hosted-style addressing
+     * based on the endpoint and configuration. */
+
+    if (aws_s3_tester_is_using_local_endpoint()) {
+        return aws_string_new_from_cursor(allocator, &g_test_endpoint);
+    }
 
     struct aws_byte_cursor endpoint_url_part0 = AWS_BYTE_CUR_INIT_FROM_STRING_LITERAL(".s3.");
     struct aws_byte_cursor endpoint_url_part1 = AWS_BYTE_CUR_INIT_FROM_STRING_LITERAL(".amazonaws.com");
@@ -364,6 +421,7 @@ struct aws_string *aws_s3_tester_build_endpoint_string(
 }
 
 AWS_STATIC_STRING_FROM_LITERAL(s_bucket_name_env_var, "CRT_S3_TEST_BUCKET_NAME");
+AWS_STATIC_STRING_FROM_LITERAL(s_endpoint_env_var, "CRT_S3_TEST_ENDPOINT");
 
 int aws_s3_tester_init(struct aws_allocator *allocator, struct aws_s3_tester *tester) {
 
@@ -375,6 +433,13 @@ int aws_s3_tester_init(struct aws_allocator *allocator, struct aws_s3_tester *te
     AWS_ZERO_STRUCT(*tester);
 
     tester->allocator = allocator;
+    
+    /* Read endpoint from environment variable if set */
+    if (aws_get_environment_value(allocator, s_endpoint_env_var, &tester->endpoint) == AWS_OP_SUCCESS &&
+        tester->endpoint != NULL) {
+        g_test_endpoint = aws_byte_cursor_from_string(tester->endpoint);
+    }
+    
     if (aws_get_environment_value(allocator, s_bucket_name_env_var, &tester->bucket_name) == AWS_OP_SUCCESS &&
         tester->bucket_name != NULL) {
         g_test_bucket_name = aws_byte_cursor_from_string(tester->bucket_name);
@@ -450,6 +515,7 @@ int aws_s3_tester_init(struct aws_allocator *allocator, struct aws_s3_tester *te
 
     tester->anonymous_creds = aws_credentials_new_anonymous(allocator);
     tester->anonymous_signing_config.credentials = tester->anonymous_creds;
+    tester->anonymous_signing_config.region = g_test_s3_region;
 #ifndef BYO_CRYPTO
     /* Setup the credentials provider */
     {
@@ -497,8 +563,15 @@ int aws_s3_tester_bind_client(struct aws_s3_tester *tester, struct aws_s3_client
             ((struct aws_signing_config_aws *)config->signing_config)->region = config->region;
         }
     }
+    
+    /* Ensure signing_config is always set (required by S3 client) */
     if (!config->signing_config) {
         config->signing_config = &tester->anonymous_signing_config;
+    }
+    
+    /* Disable TLS for local endpoint HTTP connections only */
+    if (aws_s3_tester_is_using_local_endpoint()) {
+        config->tls_mode = AWS_MR_TLS_DISABLED;
     }
 
     ASSERT_TRUE(config->shutdown_callback == NULL);
@@ -752,6 +825,7 @@ void aws_s3_tester_clean_up(struct aws_s3_tester *tester) {
     }
     aws_string_destroy(tester->bucket_name);
     aws_string_destroy(tester->public_bucket_name);
+    aws_string_destroy(tester->endpoint);
     aws_string_destroy(tester->s3express_bucket_usw2_az1_endpoint);
     aws_string_destroy(tester->s3express_bucket_use1_az4_endpoint);
 
@@ -1138,10 +1212,30 @@ struct aws_http_message *aws_s3_test_get_object_request_new(
         goto error_clean_up_message;
     }
 
-    if (aws_http_message_set_request_path(message, key)) {
-        goto error_clean_up_message;
-    }
+    /* For local endpoint, create path-style requests: /bucket/key instead of just /key */
+    if (aws_s3_tester_is_using_local_endpoint()) {
+            struct aws_byte_buf path_buffer;
+            aws_byte_buf_init(&path_buffer, allocator, 256);
 
+            /* Always use path-style for local endpoint: /bucket + key */
+            aws_byte_buf_append_byte_dynamic(&path_buffer, '/');
+            aws_byte_buf_append_dynamic(&path_buffer, &g_test_bucket_name);
+            aws_byte_buf_append_dynamic(&path_buffer, &key);
+
+            struct aws_byte_cursor path_cursor = aws_byte_cursor_from_buf(&path_buffer);
+
+
+            if (aws_http_message_set_request_path(message, path_cursor)) {
+                    aws_byte_buf_clean_up(&path_buffer);
+                    goto error_clean_up_message;
+            }
+
+            aws_byte_buf_clean_up(&path_buffer);
+    } else {
+            if (aws_http_message_set_request_path(message, key)) {
+                    goto error_clean_up_message;
+            }
+    }
     return message;
 
 error_clean_up_message:
@@ -1319,10 +1413,30 @@ struct aws_http_message *aws_s3_test_put_object_request_new_without_body(
         goto error_clean_up_message;
     }
 
-    if (aws_http_message_set_request_path(message, key)) {
-        goto error_clean_up_message;
-    }
+    if (aws_s3_tester_is_using_local_endpoint()) {
+            /* For local endpoint, create path-style requests: /bucket/key instead of just /key */
+            struct aws_byte_buf path_buffer;
+            aws_byte_buf_init(&path_buffer, allocator, 256);
 
+            /* Always use path-style for local endpoint: /bucket + key */
+            aws_byte_buf_append_byte_dynamic(&path_buffer, '/');
+            aws_byte_buf_append_dynamic(&path_buffer, &g_test_bucket_name);
+            aws_byte_buf_append_dynamic(&path_buffer, &key);
+
+            struct aws_byte_cursor path_cursor = aws_byte_cursor_from_buf(&path_buffer);
+
+
+            if (aws_http_message_set_request_path(message, path_cursor)) {
+                    aws_byte_buf_clean_up(&path_buffer);
+                    goto error_clean_up_message;
+            }
+
+            aws_byte_buf_clean_up(&path_buffer);
+    } else {
+            if (aws_http_message_set_request_path(message, key)) {
+                    goto error_clean_up_message;
+            }
+    }
     return message;
 
 error_clean_up_message:
@@ -1452,7 +1566,10 @@ int aws_s3_tester_client_new(
             client_config.tls_mode = AWS_MR_TLS_DISABLED;
             break;
         default:
-            break;
+            /* For default case: disable TLS for local endpoint, enable for others */
+            if (aws_s3_tester_is_using_local_endpoint()) {
+                client_config.tls_mode = AWS_MR_TLS_DISABLED;
+            }            break;
     }
 
     ASSERT_SUCCESS(aws_s3_tester_bind_client(
@@ -2357,7 +2474,14 @@ static struct aws_http_message *s_copy_object_request_new(
 
     /* the URI path is / followed by the key */
     char destination_path[1024];
-    snprintf(destination_path, sizeof(destination_path), "/%.*s", (int)destination_key.len, destination_key.ptr);
+    if (aws_s3_tester_is_using_local_endpoint()) {
+            /* For local endpoint, use path-style: /bucket/key instead of just /key */
+            snprintf(destination_path, sizeof(destination_path), "/%.*s/%.*s", 
+                            (int)g_test_bucket_name.len, g_test_bucket_name.ptr,
+                            (int)destination_key.len, destination_key.ptr);
+    } else {
+            snprintf(destination_path, sizeof(destination_path), "/%.*s", (int)destination_key.len, destination_key.ptr);
+    }
     struct aws_byte_cursor unencoded_destination_path = aws_byte_cursor_from_c_str(destination_path);
     struct aws_byte_buf copy_destination_path_encoded;
     aws_byte_buf_init(&copy_destination_path_encoded, allocator, 1024);

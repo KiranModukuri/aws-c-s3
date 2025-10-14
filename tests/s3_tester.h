@@ -22,6 +22,11 @@
 #include <aws/common/string.h>
 #include <aws/testing/async_stream_tester.h>
 
+/* Environment variable names */
+#define CRT_S3_TEST_ENDPOINT_ENV_VAR "CRT_S3_TEST_ENDPOINT"
+#define CRT_S3_TEST_BUCKET_NAME_ENV_VAR "CRT_S3_TEST_BUCKET_NAME"
+#define CRT_S3_TEST_SKIP_CKSUM_VALIDATE_ENV_VAR "CRT_S3_TEST_SKIP_CKSUM_VALIDATE"
+
 struct aws_client_bootstrap;
 struct aws_credentials_provider;
 struct aws_event_loop_group;
@@ -106,6 +111,7 @@ struct aws_s3_tester {
 
     struct aws_string *bucket_name;
     struct aws_string *public_bucket_name;
+    struct aws_string *endpoint;
     struct aws_string *s3express_bucket_usw2_az1_endpoint;
     struct aws_string *s3express_bucket_use1_az4_endpoint;
 
@@ -368,6 +374,18 @@ struct aws_string *aws_s3_tester_build_endpoint_string(
     const struct aws_byte_cursor *bucket_name,
     const struct aws_byte_cursor *region);
 
+/* Helper function to check if using local endpoint vs AWS S3 or other cloud endpoints
+ * Returns true for IP:port format (e.g., 127.0.0.1:9000, 192.168.1.12:80)
+ * Returns false for domain names (e.g., s3.amazonaws.com)
+ */
+bool aws_s3_tester_is_using_local_endpoint(void);
+
+/* Check if the CRT_S3_TEST_SKIP_CKSUM_VALIDATE environment variable is set
+ * Returns true if set to any non-empty value, false otherwise
+ * Used to skip checksum validation failures when server doesn't return checksum headers
+ */
+bool aws_s3_tester_should_skip_checksum_validate(void);
+
 struct aws_http_message *aws_s3_test_get_object_request_new(
     struct aws_allocator *allocator,
     struct aws_byte_cursor host,
@@ -522,6 +540,8 @@ extern const struct aws_byte_cursor g_put_object_prefix;
 
 /* If `$CRT_S3_TEST_BUCKET_NAME` environment variable is set, use that; otherwise, use aws-c-s3-test-bucket */
 extern struct aws_byte_cursor g_test_bucket_name;
+/* If `$CRT_S3_TEST_ENDPOINT` environment variable is set, use that; otherwise, use 127.0.0.1:9000 */
+extern struct aws_byte_cursor g_test_endpoint;
 /* If `$CRT_S3_TEST_BUCKET_NAME` envrionment variable is set, use `$CRT_S3_TEST_BUCKET_NAME-public`; otherwise, use
  * aws-c-s3-test-bucket-public
  */
