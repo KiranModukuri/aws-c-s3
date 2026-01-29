@@ -113,6 +113,21 @@ struct aws_s3_meta_request *aws_s3_meta_request_auto_ranged_get_new(
     }
     auto_ranged_get->initial_message_has_if_match_header = aws_http_headers_has(headers, g_if_match_header_name);
     auto_ranged_get->synced_data.first_part_size = auto_ranged_get->base.part_size;
+
+    /* When user provides a buffer for GET, use that size as the first_part_size hint.
+     * This ensures the discovery request doesn't request more data than the buffer can hold. */
+    if (options->user_buffer_options != NULL &&
+        options->user_buffer_options->transfer_buffer != NULL &&
+        options->user_buffer_options->transfer_buffer_size > 0 &&
+        options->user_buffer_options->transfer_buffer_size < auto_ranged_get->synced_data.first_part_size) {
+        auto_ranged_get->synced_data.first_part_size = options->user_buffer_options->transfer_buffer_size;
+        AWS_LOGF_DEBUG(
+            AWS_LS_S3_META_REQUEST,
+            "id=%p Auto-Ranged GET: Using user buffer size %zu as first_part_size hint",
+            (void *)&auto_ranged_get->base,
+            options->user_buffer_options->transfer_buffer_size);
+    }
+
     if (options->object_size_hint != NULL) {
         auto_ranged_get->object_size_hint_available = true;
         auto_ranged_get->object_size_hint = *options->object_size_hint;
@@ -275,7 +290,7 @@ static bool s_s3_auto_ranged_get_update(
                             (void *)meta_request);
 
                         uint64_t part_range_start = 0;
-                        uint64_t first_part_size = meta_request->part_size;
+                        uint64_t first_part_size = auto_ranged_get->synced_data.first_part_size;
                         if (auto_ranged_get->initial_message_has_range_header) {
                             /*
                              * Currently, we only discover the size of the object when the initial range header includes

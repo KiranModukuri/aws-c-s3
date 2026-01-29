@@ -24,6 +24,7 @@
 #include <aws/common/clock.h>
 #include <aws/testing/aws_test_harness.h>
 #include <inttypes.h>
+#include <string.h>
 
 /**
  * Basic User Buffer Tests (no explicit RDMA flag)
@@ -121,6 +122,224 @@ static int s_test_s3_get_object_user_buffer_multipart(struct aws_allocator *allo
     ASSERT_SUCCESS(aws_s3_tester_send_meta_request_with_options(&tester, &options, NULL));
 
     aws_byte_buf_clean_up(&user_buffer);
+    client = aws_s3_client_release(client);
+    aws_s3_tester_clean_up(&tester);
+
+    return 0;
+}
+
+/**
+ * Test: GET with user buffer SMALLER than part_size
+ * This is the actual bug scenario - when buffer < part_size, the discovery
+ * request asks for part_size bytes which exceeds the buffer, potentially
+ * causing data to go to pool buffer instead of user buffer.
+ */
+AWS_TEST_CASE(test_s3_get_user_buffer_smaller_than_part_size, s_test_s3_get_user_buffer_smaller_than_part_size)
+static int s_test_s3_get_user_buffer_smaller_than_part_size(struct aws_allocator *allocator, void *ctx) {
+    (void)ctx;
+
+    struct aws_s3_tester tester;
+    ASSERT_SUCCESS(aws_s3_tester_init(allocator, &tester));
+
+    struct aws_s3_client_config client_config = {
+        .part_size = 20 * 1024 * 1024, /* 20MB - larger than buffer! */
+    };
+
+    ASSERT_SUCCESS(aws_s3_tester_bind_client(
+        &tester, &client_config, AWS_S3_TESTER_BIND_CLIENT_REGION | AWS_S3_TESTER_BIND_CLIENT_SIGNING));
+
+    struct aws_s3_client *client = aws_s3_client_new(allocator, &client_config);
+    ASSERT_TRUE(client != NULL);
+
+    size_t object_size = 10 * 1024 * 1024; /* 10MB object */
+    size_t buffer_size = 5 * 1024 * 1024;  /* 5MB buffer - SMALLER than part_size! */
+
+    /* First, upload a 10MB file with known pattern */
+    struct aws_byte_buf put_buffer;
+    aws_byte_buf_init(&put_buffer, allocator, object_size);
+    for (size_t i = 0; i < object_size; ++i) {
+        put_buffer.buffer[i] = (uint8_t)(i % 256);
+    }
+    put_buffer.len = object_size;
+
+    uint64_t timestamp;
+    aws_high_res_clock_get_ticks(&timestamp);
+    char object_path_buffer[128];
+    snprintf(object_path_buffer, sizeof(object_path_buffer),
+             "/small_buffer_test_%llu.txt", (unsigned long long)timestamp);
+
+    struct aws_http_message *put_message = aws_s3_test_put_object_request_new_without_body(
+        allocator,
+        &g_test_endpoint,
+        g_test_body_content_type,
+        aws_byte_cursor_from_c_str(object_path_buffer),
+        object_size,
+        0);
+
+    struct aws_s3_user_buffer_options put_user_buffer_options = {
+        .transfer_buffer = put_buffer.buffer,
+        .transfer_buffer_size = put_buffer.len,
+    };
+
+    struct aws_s3_tester_meta_request_options put_options = {
+        .allocator = allocator,
+        .meta_request_type = AWS_S3_META_REQUEST_TYPE_PUT_OBJECT,
+        .message = put_message,
+        .client = client,
+        .user_buffer_options = &put_user_buffer_options,
+        .use_rdma = true,
+        .validate_type = AWS_S3_TESTER_VALIDATE_TYPE_NO_VALIDATE, /* Server doesn't return ETag for RDMA */
+    };
+
+    ASSERT_SUCCESS(aws_s3_tester_send_meta_request_with_options(&tester, &put_options, NULL));
+    aws_http_message_release(put_message);
+
+    /* Now GET with a buffer SMALLER than part_size but EQUAL to object size
+     * This tests the core fix: part_size=20MB, buffer=10MB, object=10MB
+     * Without fix: discovery asks for 20MB via RDMA with 20MB pool buffer
+     * With fix: discovery asks for 10MB (clamped to user buffer), uses user buffer
+     *
+     * We use object_size == buffer_size so the full download succeeds,
+     * but the fix is needed to use the correct buffer for RDMA.
+     */
+    struct aws_byte_buf get_buffer;
+    aws_byte_buf_init(&get_buffer, allocator, object_size); /* Buffer = object size = 10MB */
+
+    /* Poison buffer to detect if data was NOT written */
+    memset(get_buffer.buffer, 0xDE, object_size);
+
+    struct aws_s3_user_buffer_options get_user_buffer_options = {
+        .transfer_buffer = get_buffer.buffer,
+        .transfer_buffer_size = get_buffer.capacity,
+    };
+
+    struct aws_s3_meta_request_test_results test_results;
+    aws_s3_meta_request_test_results_init(&test_results, allocator);
+
+    struct aws_s3_tester_meta_request_options get_options = {
+        .allocator = allocator,
+        .meta_request_type = AWS_S3_META_REQUEST_TYPE_GET_OBJECT,
+        .client = client,
+        .get_options =
+            {
+                .object_path = aws_byte_cursor_from_c_str(object_path_buffer),
+            },
+        .user_buffer_options = &get_user_buffer_options,
+        .use_rdma = true,
+    };
+
+    ASSERT_SUCCESS(aws_s3_tester_send_meta_request_with_options(&tester, &get_options, &test_results));
+
+    /* Verify all data matches what we uploaded */
+    ASSERT_UINT_EQUALS(object_size, test_results.received_body_size);
+    ASSERT_TRUE(memcmp(get_buffer.buffer, put_buffer.buffer, object_size) == 0);
+
+    aws_s3_meta_request_test_results_clean_up(&test_results);
+    aws_byte_buf_clean_up(&put_buffer);
+    aws_byte_buf_clean_up(&get_buffer);
+    client = aws_s3_client_release(client);
+    aws_s3_tester_clean_up(&tester);
+
+    return 0;
+}
+
+/**
+ * Test: GET with user buffer LARGER than part_size but NOT a multiple
+ * Tests edge case: part_size=5MB, buffer=12MB, object=12MB (2.4 parts)
+ */
+AWS_TEST_CASE(test_s3_get_user_buffer_non_multiple_of_part_size, s_test_s3_get_user_buffer_non_multiple_of_part_size)
+static int s_test_s3_get_user_buffer_non_multiple_of_part_size(struct aws_allocator *allocator, void *ctx) {
+    (void)ctx;
+
+    struct aws_s3_tester tester;
+    ASSERT_SUCCESS(aws_s3_tester_init(allocator, &tester));
+
+    struct aws_s3_client_config client_config = {
+        .part_size = 5 * 1024 * 1024, /* 5MB parts */
+    };
+
+    ASSERT_SUCCESS(aws_s3_tester_bind_client(
+        &tester, &client_config, AWS_S3_TESTER_BIND_CLIENT_REGION | AWS_S3_TESTER_BIND_CLIENT_SIGNING));
+
+    struct aws_s3_client *client = aws_s3_client_new(allocator, &client_config);
+    ASSERT_TRUE(client != NULL);
+
+    size_t object_size = 12 * 1024 * 1024; /* 12MB = 2.4 parts (5+5+2) */
+
+    /* First, upload a 12MB file with known pattern */
+    struct aws_byte_buf put_buffer;
+    aws_byte_buf_init(&put_buffer, allocator, object_size);
+    for (size_t i = 0; i < object_size; ++i) {
+        put_buffer.buffer[i] = (uint8_t)(i % 256);
+    }
+    put_buffer.len = object_size;
+
+    uint64_t timestamp;
+    aws_high_res_clock_get_ticks(&timestamp);
+    char object_path_buffer[128];
+    snprintf(object_path_buffer, sizeof(object_path_buffer),
+             "/non_multiple_test_%llu.txt", (unsigned long long)timestamp);
+
+    struct aws_http_message *put_message = aws_s3_test_put_object_request_new_without_body(
+        allocator,
+        &g_test_endpoint,
+        g_test_body_content_type,
+        aws_byte_cursor_from_c_str(object_path_buffer),
+        object_size,
+        0);
+
+    struct aws_s3_user_buffer_options put_user_buffer_options = {
+        .transfer_buffer = put_buffer.buffer,
+        .transfer_buffer_size = put_buffer.len,
+    };
+
+    struct aws_s3_tester_meta_request_options put_options = {
+        .allocator = allocator,
+        .meta_request_type = AWS_S3_META_REQUEST_TYPE_PUT_OBJECT,
+        .message = put_message,
+        .client = client,
+        .user_buffer_options = &put_user_buffer_options,
+        .use_rdma = true,
+        .validate_type = AWS_S3_TESTER_VALIDATE_TYPE_NO_VALIDATE, /* Server doesn't return ETag for RDMA */
+    };
+
+    ASSERT_SUCCESS(aws_s3_tester_send_meta_request_with_options(&tester, &put_options, NULL));
+    aws_http_message_release(put_message);
+
+    /* GET with buffer = object_size = 12MB (not multiple of 5MB part_size) */
+    struct aws_byte_buf get_buffer;
+    aws_byte_buf_init(&get_buffer, allocator, object_size);
+    memset(get_buffer.buffer, 0xDE, object_size);
+
+    struct aws_s3_user_buffer_options get_user_buffer_options = {
+        .transfer_buffer = get_buffer.buffer,
+        .transfer_buffer_size = get_buffer.capacity,
+    };
+
+    struct aws_s3_meta_request_test_results test_results;
+    aws_s3_meta_request_test_results_init(&test_results, allocator);
+
+    struct aws_s3_tester_meta_request_options get_options = {
+        .allocator = allocator,
+        .meta_request_type = AWS_S3_META_REQUEST_TYPE_GET_OBJECT,
+        .client = client,
+        .get_options =
+            {
+                .object_path = aws_byte_cursor_from_c_str(object_path_buffer),
+            },
+        .user_buffer_options = &get_user_buffer_options,
+        .use_rdma = true,
+    };
+
+    ASSERT_SUCCESS(aws_s3_tester_send_meta_request_with_options(&tester, &get_options, &test_results));
+
+    /* Verify all data matches */
+    ASSERT_UINT_EQUALS(object_size, test_results.received_body_size);
+    ASSERT_TRUE(memcmp(get_buffer.buffer, put_buffer.buffer, object_size) == 0);
+
+    aws_s3_meta_request_test_results_clean_up(&test_results);
+    aws_byte_buf_clean_up(&put_buffer);
+    aws_byte_buf_clean_up(&get_buffer);
     client = aws_s3_client_release(client);
     aws_s3_tester_clean_up(&tester);
 
@@ -520,6 +739,9 @@ static int s_test_s3_user_buffer_put_get_roundtrip(struct aws_allocator *allocat
     /* GET */
     struct aws_byte_buf get_buffer;
     aws_byte_buf_init(&get_buffer, allocator, object_size);
+
+    /* Poison buffer to verify data actually gets written */
+    memset(get_buffer.buffer, 0xDE, object_size);
 
     struct aws_s3_user_buffer_options get_user_buffer_options = {
         .transfer_buffer = get_buffer.buffer,
