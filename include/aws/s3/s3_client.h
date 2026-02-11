@@ -1034,6 +1034,8 @@ struct aws_s3_meta_request_options {
     struct aws_byte_cursor copy_source_uri;
 };
 
+typedef int(aws_s3_user_buffer_before_register_fn)(void *user_data);
+
 /* EXPERIMENTAL - User-provided buffer options for GET/PUT operations */
 struct aws_s3_user_buffer_options {
     /* Unified transfer buffer: PUT reads from it; GET writes into it. */
@@ -1046,6 +1048,7 @@ struct aws_s3_user_buffer_options {
      * is already pinned and suitable for RDMA transfers. */
     bool buffer_is_rdma_registered;
     void *_reserved[4];
+    aws_s3_user_buffer_before_register_fn *before_register_callback;
 };
 
 /* Result details of a meta request.
