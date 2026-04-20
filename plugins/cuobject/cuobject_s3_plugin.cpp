@@ -49,7 +49,6 @@
 
 #include "cuobject_s3_plugin.h"
 #include "cuobjclient.h"
-#include "protocol.h"
 
 #include <aws/common/allocator.h>
 #include <aws/common/byte_buf.h>
@@ -564,7 +563,10 @@ static int parse_plugin_config(struct cuobject_plugin_config *out_config) {
     // Use default configuration
     out_config->max_buffer_size = 1024 * 1024 * 1024; // 1GB
     out_config->protocol_version = CUOBJ_PROTO_RDMA_DC_V1;
-    out_config->debug_logging = true;
+
+    // Turn on debug logging by setting env CUOBJECT_DEBUG_LOGGING=1
+    const char* dbg_log = std::getenv("CUOBJECT_DEBUG_LOGGING");
+    out_config->debug_logging = (dbg_log != nullptr && std::string(dbg_log) == "1");
 
     return AWS_OP_SUCCESS;
 }
