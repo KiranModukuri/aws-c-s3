@@ -49,7 +49,6 @@
 
 #include "cuobject_s3_plugin.h"
 #include "cuobjclient.h"
-#include "protocol.h"
 
 #include <aws/common/allocator.h>
 #include <aws/common/byte_buf.h>
@@ -71,6 +70,7 @@
 #include <netdb.h>
 #include <errno.h>
 #include <stdlib.h>
+#include <strings.h>
 #include <vector>
 
 extern "C" {
@@ -132,6 +132,14 @@ struct cuobject_operation_context {
 static int parse_plugin_config(struct cuobject_plugin_config *out_config);
 static std::string generate_rdma_token_via_cuobject(struct cuobject_provider *provider, const std::string &s3_key,
                                                    void *buffer, void *base_ptr, size_t size, size_t buffer_offset, cuObjOpType_t op_type);
+
+static bool cuobject_env_flag_enabled(const char *name) {
+    const char *value = std::getenv(name);
+    return value && (strcmp(value, "1") == 0 ||
+                     strcasecmp(value, "true") == 0 ||
+                     strcasecmp(value, "yes") == 0 ||
+                     strcasecmp(value, "on") == 0);
+}
 
 /**
  * cuObjClient callback for PUT operations
@@ -270,7 +278,9 @@ static int cuobject_init(
             printf("[CUOBJECT_PLUGIN] Plugin will continue with mock RDMA operations for testing\n");
         }
 
+        if (provider->config.debug_logging) {
         printf("[CUOBJECT_PLUGIN] Initialized cuObject provider\n");
+        }
 
         *out_provider = reinterpret_cast<struct aws_s3_rdma_provider*>(provider.release());
         return AWS_OP_SUCCESS;
@@ -391,7 +401,7 @@ static bool cuobject_is_memory_suitable(
                     mem_type == CUOBJ_MEMORY_CUDA_MANAGED ||
                     mem_type == CUOBJ_MEMORY_SYSTEM);
 
-    if (cuobj_provider->config.debug_logging) {
+    if (cuobj_provider->config.debug_logging && cuobject_env_flag_enabled("CUOBJECT_TRACE_MEMORY_SUITABILITY")) {
         printf("[CUOBJECT_PLUGIN] Memory suitability check: ptr=%p, size=%zu, type=%d, suitable=%s\n",
                ptr, size, (int)mem_type, suitable ? "yes" : "no");
     }
@@ -564,8 +574,9 @@ static int parse_plugin_config(struct cuobject_plugin_config *out_config) {
     // Use default configuration
     out_config->max_buffer_size = 1024 * 1024 * 1024; // 1GB
     out_config->protocol_version = CUOBJ_PROTO_RDMA_DC_V1;
-    out_config->debug_logging = true;
 
+    // Enable debug logging only if environment variable is set
+    out_config->debug_logging = cuobject_env_flag_enabled("CUOBJECT_DEBUG_LOGGING");
     return AWS_OP_SUCCESS;
 }
 

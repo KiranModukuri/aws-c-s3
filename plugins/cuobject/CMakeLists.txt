@@ -15,6 +15,7 @@
 
 cmake_minimum_required(VERSION 3.15)
 project(cuobject_s3_plugin C CXX)
+include(GNUInstallDirs)
 
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
@@ -34,37 +35,96 @@ else()
     message(STATUS "CUDA not found - building without CUDA support")
 endif()
 
-# Find cuObject library
-set(CUOBJECT_ROOT_DIR "/home/cuObject" 
-    CACHE PATH "Path to cuObject root directory")
+# Find cuObject library. The build script can point these variables either at a
+# CPack-installed cuObject tree or at this repository's build output.
+set(CUOBJECT_ROOT_DIR "" CACHE PATH "Path to cuObject root directory")
+set(CUOBJECT_INCLUDE_DIR "" CACHE PATH "Path to cuObject headers")
+set(CUOBJECT_LIB_DIR "" CACHE PATH "Path to cuObject libraries")
+set(CUFILE_INCLUDE_DIR "" CACHE PATH "Path to cuFile headers")
+set(CUFILE_LIB_DIR "" CACHE PATH "Path to cuFile libraries")
+set(CUFILE_RDMA_LIB_DIR "" CACHE PATH "Path to cuFile RDMA libraries")
+set(CUOBJECT_LIBRARY "" CACHE FILEPATH "Advanced override: exact path to libcuobjclient")
+set(CUOBJECT_CUFILE_LIBRARY "" CACHE FILEPATH "Advanced override: exact path to libcufile")
+set(CUOBJECT_ALLOW_MOCK OFF CACHE BOOL "Allow building the mock cuObject plugin when real cuObject is not found")
 
-if(EXISTS "${CUOBJECT_ROOT_DIR}/include/cuobjclient.h")
-    message(STATUS "Found cuObject headers at: ${CUOBJECT_ROOT_DIR}")
-    set(CUOBJECT_INCLUDE_DIR "${CUOBJECT_ROOT_DIR}/include")
-    
-    # Force use of packaged cuObject library (has all required symbols)
-    set(CUOBJECT_PACKAGED_LIB "${CUOBJECT_ROOT_DIR}/build_x86/_CPack_Packages/Linux/TGZ/cuObject-0.8.5-Linux/src/lib/libcuobjclient.so")
-    if(EXISTS "${CUOBJECT_PACKAGED_LIB}")
-        set(CUOBJECT_LIBRARY "${CUOBJECT_PACKAGED_LIB}")
-        message(STATUS "Using packaged cuObject library: ${CUOBJECT_LIBRARY}")
-    else()
-        # Fallback to lib_src version
-        find_library(CUOBJECT_LIBRARY
-            NAMES cuobjclient cuobject
-            PATHS "${CUOBJECT_ROOT_DIR}/build_x86/lib_src" 
-                  "${CUOBJECT_ROOT_DIR}/build_aarch64/lib_src"
-                  "${CUOBJECT_ROOT_DIR}/lib"
-            NO_DEFAULT_PATH)
-        message(STATUS "Using fallback cuObject library: ${CUOBJECT_LIBRARY}")
+foreach(_empty_cache_var
+        CUOBJECT_INCLUDE_DIR
+        CUOBJECT_LIB_DIR
+        CUFILE_INCLUDE_DIR
+        CUFILE_LIB_DIR
+        CUFILE_RDMA_LIB_DIR
+        CUOBJECT_LIBRARY
+        CUOBJECT_CUFILE_LIBRARY)
+    if(DEFINED ${_empty_cache_var} AND "${${_empty_cache_var}}" STREQUAL "")
+        unset(${_empty_cache_var} CACHE)
+        unset(${_empty_cache_var})
     endif()
-    
-    if(CUOBJECT_LIBRARY)
+endforeach()
+
+set(_CUOBJECT_INCLUDE_HINTS)
+if(CUOBJECT_INCLUDE_DIR)
+    list(APPEND _CUOBJECT_INCLUDE_HINTS "${CUOBJECT_INCLUDE_DIR}")
+endif()
+if(CUOBJECT_ROOT_DIR)
+    list(APPEND _CUOBJECT_INCLUDE_HINTS
+        "${CUOBJECT_ROOT_DIR}/include"
+        "${CUOBJECT_ROOT_DIR}/src/include")
+endif()
+
+set(_CUOBJECT_LIB_HINTS)
+if(CUOBJECT_LIB_DIR)
+    list(APPEND _CUOBJECT_LIB_HINTS "${CUOBJECT_LIB_DIR}")
+endif()
+if(CUOBJECT_ROOT_DIR)
+    list(APPEND _CUOBJECT_LIB_HINTS
+        "${CUOBJECT_ROOT_DIR}/lib"
+        "${CUOBJECT_ROOT_DIR}/src/lib"
+        "${CUOBJECT_ROOT_DIR}/lib_src"
+        "${CUOBJECT_ROOT_DIR}/build/lib_src")
+endif()
+
+if(NOT CUOBJECT_INCLUDE_DIR)
+    find_path(CUOBJECT_INCLUDE_DIR
+        NAMES cuobjclient.h
+        HINTS ${_CUOBJECT_INCLUDE_HINTS}
+        PATHS
+            /usr/local/cuda/targets/x86_64-linux/include
+            /usr/local/cuda/include
+            /opt/nvidia/cuobject/include
+            /opt/nvidia/gds/include)
+endif()
+
+if(NOT CUOBJECT_LIBRARY)
+    find_library(CUOBJECT_LIBRARY
+        NAMES cuobjclient libcuobjclient.so.1 libcuobjclient.so
+        HINTS ${_CUOBJECT_LIB_HINTS}
+        PATHS
+            /usr/local/cuda/targets/x86_64-linux/lib
+            /usr/local/cuda/lib64
+            /opt/nvidia/cuobject/lib64
+            /opt/nvidia/cuobject/lib
+            /opt/nvidia/gds/lib)
+endif()
+
+if(CUOBJECT_INCLUDE_DIR AND EXISTS "${CUOBJECT_INCLUDE_DIR}/cuobjclient.h")
+    message(STATUS "Found cuObject headers at: ${CUOBJECT_INCLUDE_DIR}")
+else()
+    if(CUOBJECT_ALLOW_MOCK)
+        message(WARNING "cuObject headers not found - building with stub implementation")
+    else()
+        message(FATAL_ERROR "cuObject headers not found. Set CUOBJECT_INCLUDE_DIR or configure with -DCUOBJECT_ALLOW_MOCK=ON.")
+    endif()
+endif()
+
+if(CUOBJECT_LIBRARY AND EXISTS "${CUOBJECT_LIBRARY}")
+    get_filename_component(CUOBJECT_LIBRARY_DIR "${CUOBJECT_LIBRARY}" DIRECTORY)
         message(STATUS "Found cuObject library: ${CUOBJECT_LIBRARY}")
     else()
+    if(CUOBJECT_ALLOW_MOCK)
         message(WARNING "cuObject library not found - building with stub implementation")
+    else()
+        message(FATAL_ERROR "cuObject library not found. Set CUOBJECT_LIB_DIR, install it in a standard library path, or configure with -DCUOBJECT_ALLOW_MOCK=ON.")
     endif()
-else()
-    message(WARNING "cuObject headers not found at ${CUOBJECT_ROOT_DIR} - building with stub implementation")
 endif()
 
 # AWS CRT includes - monorepo layout under crt/*
@@ -83,7 +143,7 @@ endif()
 set(AWS_COMMON_BUILD_DIR "${AWS_COMMON_ROOT_DIR}/build")
 
 # Plugin source files
-if(CUOBJECT_LIBRARY)
+if(CUOBJECT_LIBRARY AND EXISTS "${CUOBJECT_LIBRARY}")
     set(PLUGIN_SOURCES cuobject_s3_plugin.cpp)
     message(STATUS "Building real cuObject plugin with library support")
 else()
@@ -132,22 +192,19 @@ endif()
 # Add cuObject includes if available
 if(CUOBJECT_INCLUDE_DIR)
     target_include_directories(cuobject_s3_plugin PRIVATE ${CUOBJECT_INCLUDE_DIR})
-    # Also add cufile include path (needed by cuobjclient.h)
-    target_include_directories(cuobject_s3_plugin PRIVATE 
-        "${CUOBJECT_ROOT_DIR}/build_x86/_CPack_Packages/Linux/TGZ/cuObject-0.8.3-Linux/src/include"
-        "${CUOBJECT_ROOT_DIR}/build_aarch64/_CPack_Packages/Linux/TGZ/cuObject-0.8.3-Linux/src/include"
-    )
     # Try to find cufile headers from common locations or env override
+    if(NOT CUFILE_INCLUDE_DIR)
     find_path(CUFILE_INCLUDE_DIR
         NAMES cufile.h
+            HINTS
+                $ENV{CUFILE_INCLUDE_DIR}
+                ${_CUOBJECT_INCLUDE_HINTS}
         PATHS
-            $ENV{CUFILE_INCLUDE_DIR}
-            ${CUOBJECT_ROOT_DIR}/build_x86/_CPack_Packages/Linux/TGZ/cuObject-0.8.3-Linux/src/include
-            ${CUOBJECT_ROOT_DIR}/build_aarch64/_CPack_Packages/Linux/TGZ/cuObject-0.8.3-Linux/src/include
+                /usr/local/cuda/targets/x86_64-linux/include
             /usr/local/cuda/include
             /opt/nvidia/gds/include
-            /usr/include
-        NO_DEFAULT_PATH)
+                /usr/include)
+    endif()
     if (CUFILE_INCLUDE_DIR)
         message(STATUS "Found cufile headers at: ${CUFILE_INCLUDE_DIR}")
         target_include_directories(cuobject_s3_plugin PRIVATE ${CUFILE_INCLUDE_DIR})
@@ -185,33 +242,44 @@ else()
 endif()
 
 # Link cuObject library if available
-if(CUOBJECT_LIBRARY)
+if(CUOBJECT_LIBRARY AND EXISTS "${CUOBJECT_LIBRARY}")
     target_link_libraries(cuobject_s3_plugin PRIVATE ${CUOBJECT_LIBRARY})
     
-    # Also link against the cuObject packaged cufile library
+    # Also link against cufile when available. Prefer the repository or
+    # caller-provided release output over system installs.
+    if(NOT CUOBJECT_CUFILE_LIBRARY)
     find_library(CUOBJECT_CUFILE_LIBRARY
-        NAMES cufile
+            NAMES cufile libcufile.so libcufile.so.0
+            HINTS
+                "${CUFILE_LIB_DIR}"
+                $ENV{CUFILE_LIB_DIR}
+                ${_CUOBJECT_LIB_HINTS}
         PATHS
-            "${CUOBJECT_ROOT_DIR}/build_x86/_CPack_Packages/Linux/TGZ/cuObject-0.8.3-Linux/src/lib"
-            $ENV{CUFILE_LIB_DIR}
+                /usr/local/cuda/targets/x86_64-linux/lib
             /opt/nvidia/gds/lib
             /usr/local/cuda/lib64
             /usr/lib/x86_64-linux-gnu
-            /usr/lib64
-        NO_DEFAULT_PATH)
+                /usr/lib64)
+    endif()
     
     if(CUOBJECT_CUFILE_LIBRARY)
         target_link_libraries(cuobject_s3_plugin PRIVATE ${CUOBJECT_CUFILE_LIBRARY})
         message(STATUS "Linking against cuObject cufile library: ${CUOBJECT_CUFILE_LIBRARY}")
     endif()
     
-    # Set RPATH to prefer cuObject packaged libraries
-    set(CUOBJECT_LIB_DIR "${CUOBJECT_ROOT_DIR}/build_x86/_CPack_Packages/Linux/TGZ/cuObject-0.8.3-Linux/src/lib")
+    # Set RPATH to prefer caller-provided cuObject/cuFile release libraries.
+    set(_PLUGIN_RPATHS
+        "${CUOBJECT_LIBRARY_DIR}"
+        "${CUOBJECT_LIB_DIR}"
+        "${CUFILE_LIB_DIR}"
+        "${CUFILE_RDMA_LIB_DIR}")
+    list(FILTER _PLUGIN_RPATHS EXCLUDE REGEX "^$")
+    list(REMOVE_DUPLICATES _PLUGIN_RPATHS)
     set_target_properties(cuobject_s3_plugin PROPERTIES
-        BUILD_RPATH "${CUOBJECT_LIB_DIR}"
-        INSTALL_RPATH "${CUOBJECT_LIB_DIR}"
+        BUILD_RPATH "${_PLUGIN_RPATHS}"
+        INSTALL_RPATH "${_PLUGIN_RPATHS}"
         BUILD_RPATH_USE_ORIGIN TRUE
-        INSTALL_RPATH_USE_LINK_PATH FALSE
+        INSTALL_RPATH_USE_LINK_PATH TRUE
     )
     
     target_compile_definitions(cuobject_s3_plugin PRIVATE HAVE_CUOBJECT=1)
@@ -244,7 +312,7 @@ target_compile_options(cuobject_s3_plugin PRIVATE
 
 # Install plugin
 install(TARGETS cuobject_s3_plugin
-    LIBRARY DESTINATION lib/aws-s3-plugins
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/aws-s3-plugins
     RUNTIME DESTINATION bin
 )
 
@@ -429,4 +497,8 @@ message(STATUS "cuObject S3 Plugin Configuration:")
 message(STATUS "  CUDA Support: ${CUDA_FOUND}")
 message(STATUS "  cuObject Library: ${CUOBJECT_LIBRARY}")
 message(STATUS "  cuObject Include: ${CUOBJECT_INCLUDE_DIR}")
-message(STATUS "  Install Directory: ${CMAKE_INSTALL_PREFIX}/lib/aws-s3-plugins") 
+message(STATUS "  cuObject Lib Dir: ${CUOBJECT_LIB_DIR}")
+message(STATUS "  cuFile Library: ${CUOBJECT_CUFILE_LIBRARY}")
+message(STATUS "  cuFile Include: ${CUFILE_INCLUDE_DIR}")
+message(STATUS "  cuFile RDMA Lib Dir: ${CUFILE_RDMA_LIB_DIR}")
+message(STATUS "  Install Directory: ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/aws-s3-plugins")
