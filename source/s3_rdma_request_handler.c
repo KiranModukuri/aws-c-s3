@@ -91,6 +91,14 @@ static void s_prepare_rdma_put_headers(
     /* No Content-Length header - add it with value 0 for RDMA PUT */
     aws_http_headers_set(headers, content_length_header, zero_content_length);
 
+    /* The Content-Length has been zeroed and the RDMA token header has been added, 
+     * so we should detach the HTTP body stream
+     * Othersise the length will be 0.
+     */
+    if (request && request->send_data.message) {
+        aws_http_message_set_body_stream(request->send_data.message, NULL);
+    }
+
     /* Remove HTTP body-related headers added for chunked encoding.
      * IMPORTANT: Preserve user-specified Content-Encoding (e.g., gzip, deflate) as it's object metadata.
      * Only remove aws-chunked which is added for trailing checksums. */
