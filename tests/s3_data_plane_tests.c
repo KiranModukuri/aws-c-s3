@@ -6567,6 +6567,8 @@ static int s_test_s3_range_requests(struct aws_allocator *allocator, void *ctx) 
      * versa.*/
     const struct aws_byte_cursor headers_to_ignore[] = {
         AWS_BYTE_CUR_INIT_FROM_STRING_LITERAL("Connection"),
+        AWS_BYTE_CUR_INIT_FROM_STRING_LITERAL("X-Amz-Rdma-Bytes"),
+        AWS_BYTE_CUR_INIT_FROM_STRING_LITERAL("X-Amz-Rdma-Reply"),
     };
 
     struct aws_s3_tester_client_options client_options = {
@@ -6701,7 +6703,7 @@ static int s_test_s3_range_requests(struct aws_allocator *allocator, void *ctx) 
                 ASSERT_SUCCESS(aws_http_headers_erase(range_get_headers, verify_header.name));
             }
 
-            for (size_t i = 0; i < aws_http_headers_count(range_get_headers); ++i) {
+            for (size_t i = 0; i < aws_http_headers_count(range_get_headers);) {
                 struct aws_http_header header;
 
                 ASSERT_SUCCESS(aws_http_headers_get_index(range_get_headers, i, &header));
@@ -6721,6 +6723,7 @@ static int s_test_s3_range_requests(struct aws_allocator *allocator, void *ctx) 
                 }
 
                 AWS_LOGF_INFO(AWS_LS_S3_GENERAL, "Left over header: " PRInSTR, AWS_BYTE_CURSOR_PRI(header.name));
+                ++i;
             }
 
             ASSERT_TRUE(aws_http_headers_count(range_get_headers) == 0);

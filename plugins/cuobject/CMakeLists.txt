@@ -169,6 +169,7 @@ find_package(aws-c-s3 CONFIG QUIET)
 if (aws-c-s3_FOUND)
     target_include_directories(cuobject_s3_plugin PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
+        ${AWS_CRT_ROOT_DIR}/include
         $<TARGET_PROPERTY:AWS::aws-c-s3,INTERFACE_INCLUDE_DIRECTORIES>
     )
 else()

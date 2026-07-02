@@ -74,6 +74,28 @@ static void s_aws_s3_rdma_request_handler_destroy(void *user_data) {
     aws_mem_release(handler->allocator, handler);
 }
 
+static void s_finalize_registered_request_buffer(
+    struct aws_s3_meta_request *meta_request,
+    struct aws_s3_request *request,
+    void *request_buffer) {
+
+    struct aws_s3_client *client = meta_request->client;
+
+    if (!client || !request->rdma_buffer_registered) {
+        return;
+    }
+
+    if (client->rdma_buffer_manager) {
+        aws_s3_rdma_buffer_manager_finalize_buffer(client->rdma_buffer_manager, request);
+        return;
+    }
+
+    if (client->rdma_provider && request_buffer) {
+        aws_s3_rdma_provider_deregister_memory(client->rdma_provider, request_buffer);
+    }
+    request->rdma_buffer_registered = 0;
+}
+
 /**
  * Prepare HTTP headers for RDMA PUT operation.
  * Removes body-related headers since data is transferred out-of-band via RDMA.
@@ -359,9 +381,6 @@ static void s_determine_rdma_eligibility_and_buffer_info(
         default:
             AWS_LOGF_DEBUG(AWS_LS_S3_META_REQUEST, "id=%p Request type %d not suitable for RDMA",
                          (void *)meta_request, request->request_type);
-            if (request->request_type != AWS_S3_REQUEST_TYPE_GET_OBJECT) {
-                AWS_ASSERT(request->request_body.buffer && request->request_body.len > 0);
-            }
             break;
     }
     
@@ -380,7 +399,7 @@ static void s_determine_rdma_eligibility_and_buffer_info(
 /**
  * Register buffer with RDMA provider and process RDMA tokens.
  */
-static void s_register_and_process_rdma_tokens(
+static int s_register_and_process_rdma_tokens(
     struct aws_s3_rdma_request_handler *handler,
     struct aws_s3_meta_request *meta_request,
     struct aws_s3_request *request,
@@ -410,7 +429,7 @@ static void s_register_and_process_rdma_tokens(
                 (void *)meta_request,
                 (void *)request,
                 register_result);
-            return;
+            return aws_raise_error(AWS_ERROR_S3_RDMA_INVALID_TOKEN);
         }
     }
 
@@ -425,16 +444,24 @@ static void s_register_and_process_rdma_tokens(
 
         /* Process RDMA token for request using vtable method */
         if (handler->vtable && handler->vtable->process_request_token) {
-            handler->vtable->process_request_token(
-                handler, meta_request, request, buffer_info->buffer, buffer_info->size);
+            if (handler->vtable->process_request_token(
+                    handler, meta_request, request, buffer_info->buffer, buffer_info->size) != AWS_OP_SUCCESS) {
+                s_finalize_registered_request_buffer(meta_request, request, buffer_info->buffer);
+                return aws_raise_error(AWS_ERROR_S3_RDMA_INVALID_TOKEN);
+            }
 
             /* Calculate and add RDMA checksum headers if needed */
             if (handler->vtable->calculate_rdma_checksum_and_add_header) {
-                handler->vtable->calculate_rdma_checksum_and_add_header(
-                    handler, meta_request, request, buffer_info->buffer, buffer_info->size);
+                if (handler->vtable->calculate_rdma_checksum_and_add_header(
+                        handler, meta_request, request, buffer_info->buffer, buffer_info->size) != AWS_OP_SUCCESS) {
+                    s_finalize_registered_request_buffer(meta_request, request, buffer_info->buffer);
+                    return aws_raise_error(AWS_ERROR_S3_RDMA_INVALID_TOKEN);
+                }
             }
         }
     }
+
+    return AWS_OP_SUCCESS;
 }
 
 /* Default implementation for request token processing */
@@ -551,10 +578,7 @@ static int s_default_process_request_token(
                     AWS_LS_S3_META_REQUEST,
                     "id=%p RDMA provider returned empty token",
                     (void *)meta_request);
-                if (request->rdma_buffer_registered) {
-                    aws_s3_rdma_provider_deregister_memory(client->rdma_provider, request_buffer);
-                    request->rdma_buffer_registered = 0;
-                }
+                s_finalize_registered_request_buffer(meta_request, request, request_buffer);
                 return aws_raise_error(AWS_ERROR_INVALID_STATE);
             }
 
@@ -590,10 +614,7 @@ static int s_default_process_request_token(
                     AWS_LS_S3_META_REQUEST,
                     "id=%p Failed to add RDMA token header",
                     (void *)meta_request);
-                if (request->rdma_buffer_registered) {
-                    aws_s3_rdma_provider_deregister_memory(client->rdma_provider, request_buffer);
-                    request->rdma_buffer_registered = 0;
-                }
+                s_finalize_registered_request_buffer(meta_request, request, request_buffer);
                 return aws_raise_error(AWS_ERROR_INVALID_STATE);
             }
         }
@@ -610,12 +631,12 @@ static int s_default_process_request_token(
                 AWS_LS_S3_META_REQUEST,
                 "id=%p Deregistering buffer due to RDMA token generation failure",
                 (void *)meta_request);
-            aws_s3_rdma_provider_deregister_memory(client->rdma_provider, request_buffer);
-            request->rdma_buffer_registered = 0;
+            s_finalize_registered_request_buffer(meta_request, request, request_buffer);
         }
 
-        /* Disable RDMA for retry - next attempt will use regular HTTP with body */
-        request->disable_rdma_on_retry = 1;
+        if (!request->is_user_provided_buffer) {
+            request->disable_rdma_on_retry = 1;
+        }
         
         /* Return error to trigger retry. The retry will skip RDMA and use normal HTTP path with body. */
         return aws_raise_error(AWS_ERROR_S3_INTERNAL_ERROR);
@@ -705,10 +726,9 @@ static int s_default_process_reply_token(
         request->disable_rdma_on_retry = 1;
 
         /* Clean up registered buffer */
-        if (request->rdma_buffer_registered && response_buffer) {
-            aws_s3_rdma_provider_deregister_memory(client->rdma_provider, response_buffer);
+        if (request->rdma_buffer_registered) {
+            s_finalize_registered_request_buffer(meta_request, request, response_buffer);
             AWS_LOGF_DEBUG(AWS_LS_S3_META_REQUEST, "id=%p Deregistered RDMA buffer after error", (void *)meta_request);
-            request->rdma_buffer_registered = 0;
         }
 
         /* Return error to trigger retry with regular HTTP */
@@ -947,7 +967,8 @@ static uint64_t s_process_rdma_bytes_header(
     }
     
     /* Parse the transferred bytes value */
-    if (aws_byte_cursor_utf8_parse_u64(rdma_bytes_cursor, &rdma_bytes) == AWS_OP_SUCCESS) {
+    if (aws_byte_cursor_utf8_parse_u64(rdma_bytes_cursor, &rdma_bytes) == AWS_OP_SUCCESS &&
+        rdma_bytes <= (uint64_t)request->send_data.response_body.capacity) {
         AWS_LOGF_TRACE(AWS_LS_S3_META_REQUEST, 
                        "id=%p: RDMA bytes header captured - value %llu for request %p (original value: %.*s)",
                        (void *)meta_request, (unsigned long long)rdma_bytes, (void *)request,
@@ -971,8 +992,12 @@ static uint64_t s_process_rdma_bytes_header(
         }
     } else {
         AWS_LOGF_WARN(AWS_LS_S3_META_REQUEST,
-                      "id=%p: Failed to parse RDMA bytes header value: %.*s",
-                      (void *)meta_request, (int)header_value->len, (const char *)header_value->ptr);
+                      "id=%p: Invalid RDMA bytes header value or value exceeds buffer capacity: %.*s (capacity=%zu)",
+                      (void *)meta_request,
+                      (int)header_value->len,
+                      (const char *)header_value->ptr,
+                      request->send_data.response_body.capacity);
+        rdma_bytes = 0;
     }
     
     return rdma_bytes;
@@ -1083,6 +1108,9 @@ static int s_default_prepare_request(
         return AWS_OP_SUCCESS;
     }
 
+    bool is_put_request = request->request_type == AWS_S3_REQUEST_TYPE_PUT_OBJECT ||
+                          request->request_type == AWS_S3_REQUEST_TYPE_UPLOAD_PART;
+
     /* Determine RDMA eligibility and extract buffer information */
     struct rdma_buffer_info buffer_info;
     s_determine_rdma_eligibility_and_buffer_info(meta_request, request, client, &buffer_info);
@@ -1110,7 +1138,27 @@ static int s_default_prepare_request(
             buffer_info.size);
         
         if (is_suitable) {
-            s_register_and_process_rdma_tokens(handler, meta_request, request, client, &buffer_info);
+            if (s_register_and_process_rdma_tokens(handler, meta_request, request, client, &buffer_info) !=
+                AWS_OP_SUCCESS) {
+                if (request->is_user_provided_buffer) {
+                    return AWS_OP_ERR;
+                }
+
+                request->disable_rdma_on_retry = 1;
+                if (is_put_request) {
+                    return AWS_OP_ERR;
+                }
+
+                AWS_LOGF_DEBUG(
+                    AWS_LS_S3_META_REQUEST,
+                    "id=%p RDMA setup failed for aws-c-s3-owned GET buffer; continuing without RDMA",
+                    (void *)meta_request);
+            }
+        } else if (request->is_user_provided_buffer || is_put_request) {
+            if (!request->is_user_provided_buffer) {
+                request->disable_rdma_on_retry = 1;
+            }
+            return aws_raise_error(AWS_ERROR_S3_RDMA_INVALID_TOKEN);
         }
     }
 
@@ -1234,6 +1282,23 @@ static int s_default_validate_content_size(
     AWS_PRECONDITION(request);
 
     (void)handler;  /* Unused parameter */
+
+    if (request->request_type == AWS_S3_REQUEST_TYPE_GET_OBJECT && request->is_user_provided_buffer) {
+        size_t expected_bytes = request->send_data.response_body.capacity;
+        if (!request->rdma_transfer_succeeded || request->send_data.response_body.len != expected_bytes) {
+            AWS_LOGF_ERROR(
+                AWS_LS_S3_META_REQUEST,
+                "id=%p User-buffer GET did not complete the required RDMA transfer "
+                "(confirmed=%d, transferred=%zu, expected=%zu)",
+                (void *)meta_request,
+                request->rdma_transfer_succeeded,
+                request->send_data.response_body.len,
+                expected_bytes);
+            s_finalize_registered_request_buffer(
+                meta_request, request, request->send_data.response_body.buffer);
+            return aws_raise_error(AWS_ERROR_S3_RDMA_INVALID_TOKEN);
+        }
+    }
 
     return s_validate_initial_get_object_size(meta_request, request);
 }

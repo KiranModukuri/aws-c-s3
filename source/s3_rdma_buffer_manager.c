@@ -82,6 +82,17 @@ static int s_default_prepare_buffer_for_rdma(
         AWS_LOGF_DEBUG(AWS_LS_S3_RDMA, "id=%p Buffer not suitable for RDMA", (void *)manager);
         return AWS_OP_SUCCESS;
     }
+
+    if (aws_s3_rdma_provider_is_slice_pre_registered(manager->rdma_provider, buffer, buffer_size)) {
+        request->rdma_buffer_registered = 1;
+        AWS_LOGF_TRACE(
+            AWS_LS_S3_RDMA,
+            "id=%p Buffer slice is inside a pre-registered base; skipping per-chunk register: %p (size: %zu)",
+            (void *)manager,
+            buffer,
+            buffer_size);
+        return AWS_OP_SUCCESS;
+    }
     
     /* Register buffer with RDMA provider */
     int register_result = aws_s3_rdma_provider_register_memory(manager->rdma_provider, buffer, buffer_size);
@@ -136,6 +147,26 @@ static int s_default_finalize_buffer(
                      (void *)manager, request->request_type, request->request_body.buffer);
         request->rdma_buffer_registered = 0; /* Clear flag anyway */
         return AWS_OP_SUCCESS;
+    }
+
+    {
+        size_t slice_size = 0;
+        if (request->request_type == AWS_S3_REQUEST_TYPE_GET_OBJECT) {
+            slice_size = request->send_data.response_body.capacity;
+        } else {
+            slice_size = request->request_body.len;
+        }
+        if (slice_size > 0 &&
+            aws_s3_rdma_provider_is_slice_pre_registered(manager->rdma_provider, buffer, slice_size)) {
+            request->rdma_buffer_registered = 0;
+            AWS_LOGF_TRACE(
+                AWS_LS_S3_RDMA,
+                "id=%p Buffer slice is inside a pre-registered base; skipping per-chunk dereg: %p (size: %zu)",
+                (void *)manager,
+                buffer,
+                slice_size);
+            return AWS_OP_SUCCESS;
+        }
     }
     
     /* Deregister buffer */

@@ -422,7 +422,6 @@ struct aws_http_message *aws_s3_upload_part_message_new(
     AWS_PRECONDITION(allocator);
     AWS_PRECONDITION(base_message);
     AWS_PRECONDITION(part_number > 0);
-    AWS_PRECONDITION(buffer);
 
     struct aws_http_message *message = aws_s3_message_util_copy_http_message_no_body_filter_headers(
         allocator,

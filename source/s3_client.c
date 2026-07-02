@@ -976,6 +976,29 @@ static void s_s3_client_body_streaming_elg_shutdown(void *user_data) {
     /* END CRITICAL SECTION */
 }
 
+int aws_s3_client_pre_register_rdma_buffer(
+    struct aws_s3_client *client,
+    void *base,
+    size_t size) {
+
+    if (!client || !base || size == 0 || !client->enable_rdma || !client->rdma_provider) {
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
+
+    return aws_s3_rdma_provider_pre_register_memory(client->rdma_provider, base, size);
+}
+
+int aws_s3_client_release_rdma_buffer(
+    struct aws_s3_client *client,
+    void *base) {
+
+    if (!client || !base || !client->enable_rdma || !client->rdma_provider) {
+        return aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+    }
+
+    return aws_s3_rdma_provider_release_memory(client->rdma_provider, base);
+}
+
 uint32_t aws_s3_client_queue_requests_threaded(
     struct aws_s3_client *client,
     struct aws_linked_list *request_list,
@@ -1406,6 +1429,8 @@ static struct aws_s3_meta_request *s_s3_client_meta_request_factory_default(
         content_length_found = true;
     }
 
+    bool rdma_available = client->enable_rdma && client->rdma_provider;
+
     /* There are multiple ways to pass the body in, ensure only 1 was used */
     int body_source_count = 0;
     if (aws_http_message_get_body_stream(options->message) != NULL) {
@@ -1477,12 +1502,20 @@ static struct aws_s3_meta_request *s_s3_client_meta_request_factory_default(
         
         /* For PUT requests, user_buffer_options requires RDMA to actually use the buffer.
          * Without RDMA, the buffer would be ignored and an empty PUT would be sent. */
-        if (options->type == AWS_S3_META_REQUEST_TYPE_PUT_OBJECT && !options->use_rdma) {
+        if (options->type == AWS_S3_META_REQUEST_TYPE_PUT_OBJECT && (!options->use_rdma || !rdma_available)) {
             AWS_LOGF_ERROR(
                 AWS_LS_S3_META_REQUEST,
                 "Could not create meta request. "
-                "user_buffer_options for PUT requires use_rdma=true. "
-                "Without RDMA, the user buffer would be ignored.");
+                "user_buffer_options for PUT requires use_rdma=true and an active RDMA provider.");
+            aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
+            return NULL;
+        }
+
+        if (rdma_available && options->use_rdma &&
+            options->user_buffer_options->transfer_buffer_size < client->rdma_min_transfer_size) {
+            AWS_LOGF_ERROR(
+                AWS_LS_S3_META_REQUEST,
+                "Could not create meta request. user_buffer_options is smaller than the RDMA threshold.");
             aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
             return NULL;
         }
@@ -1505,8 +1538,8 @@ static struct aws_s3_meta_request *s_s3_client_meta_request_factory_default(
         aws_raise_error(AWS_ERROR_INVALID_ARGUMENT);
         return NULL;
     }
-     /* check if RDMA ready */
-    bool rdma_enabled  =  aws_s3_check_rdma_ready(client, options, content_length);
+    /* check if RDMA ready */
+    bool rdma_enabled = aws_s3_check_rdma_ready(client, options, content_length);
     size_t part_size = client->part_size;
     if (options->part_size != 0) {
         if (options->part_size > SIZE_MAX) {

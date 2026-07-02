@@ -56,6 +56,8 @@
 #include <aws/common/logging.h>
 #include <aws/common/string.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <unordered_map>
 #include <memory>
 #include <mutex>
@@ -63,6 +65,7 @@
 #include <sstream>
 #include <cstring>
 #include <atomic>
+#include <stdint.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -90,6 +93,10 @@ struct cuobject_provider {
     /* Memory registration tracking */
     std::unordered_map<void*, size_t> registered_memory;
     std::mutex memory_mutex;
+
+    /* Register-once caller-owned buffers keyed by base pointer. */
+    std::unordered_map<void*, size_t> pre_registered_memory;
+    std::mutex pre_registered_mutex;
 
     /* RDMA token tracking */
     std::unordered_map<std::string, void*> pending_operations;
@@ -139,6 +146,42 @@ static bool cuobject_env_flag_enabled(const char *name) {
                      strcasecmp(value, "true") == 0 ||
                      strcasecmp(value, "yes") == 0 ||
                      strcasecmp(value, "on") == 0);
+}
+
+static bool find_pre_registered_base_locked(
+    struct cuobject_provider *provider,
+    const void *ptr,
+    size_t size,
+    void **out_base,
+    size_t *out_base_size,
+    size_t *out_offset) {
+
+    uintptr_t begin = (uintptr_t)ptr;
+    uintptr_t end = begin + size;
+    if (end < begin) {
+        return false;
+    }
+
+    for (const auto &entry : provider->pre_registered_memory) {
+        uintptr_t base = (uintptr_t)entry.first;
+        uintptr_t base_end = base + entry.second;
+        if (base_end < base) {
+            continue;
+        }
+        if (begin >= base && end <= base_end) {
+            if (out_base) {
+                *out_base = entry.first;
+            }
+            if (out_base_size) {
+                *out_base_size = entry.second;
+            }
+            if (out_offset) {
+                *out_offset = (size_t)(begin - base);
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -301,6 +344,16 @@ static void cuobject_cleanup(struct aws_s3_rdma_provider *provider) {
 
     cuobject_provider *cuobj_provider = reinterpret_cast<cuobject_provider*>(provider);
 
+    for (const auto &entry : cuobj_provider->pre_registered_memory) {
+        cuobj_provider->client->cuMemObjPutDescriptor(entry.first);
+    }
+    cuobj_provider->pre_registered_memory.clear();
+
+    for (const auto &entry : cuobj_provider->registered_memory) {
+        cuobj_provider->client->cuMemObjPutDescriptor(entry.first);
+    }
+    cuobj_provider->registered_memory.clear();
+
     // Cleanup C++ objects (unique_ptr handles cuObjClient cleanup)
     delete cuobj_provider;
 }
@@ -318,6 +371,17 @@ static int cuobject_register_memory(
     }
 
     cuobject_provider *cuobj_provider = reinterpret_cast<cuobject_provider*>(provider);
+
+    {
+        std::lock_guard<std::mutex> lock(cuobj_provider->pre_registered_mutex);
+        if (find_pre_registered_base_locked(cuobj_provider, ptr, size, nullptr, nullptr, nullptr)) {
+            if (cuobj_provider->config.debug_logging) {
+                printf("[CUOBJECT_PLUGIN] register_memory: slice inside pre-registered base, skipping (ptr=%p, size=%zu)\n",
+                       ptr, size);
+            }
+            return AWS_OP_SUCCESS;
+        }
+    }
 
     // Check memory type
     cuObjMemoryType_t mem_type = cuObjClient::getMemoryType(ptr);
@@ -361,6 +425,13 @@ static int cuobject_deregister_memory(
     cuobject_provider *cuobj_provider = reinterpret_cast<cuobject_provider*>(provider);
 
     {
+        std::lock_guard<std::mutex> lock(cuobj_provider->pre_registered_mutex);
+        if (find_pre_registered_base_locked(cuobj_provider, ptr, 1, nullptr, nullptr, nullptr)) {
+            return AWS_OP_SUCCESS;
+        }
+    }
+
+    {
         std::lock_guard<std::mutex> lock(cuobj_provider->memory_mutex);
         auto it = cuobj_provider->registered_memory.find(ptr);
         if (it != cuobj_provider->registered_memory.end()) {
@@ -376,6 +447,76 @@ static int cuobject_deregister_memory(
     }
 
     return AWS_OP_SUCCESS; // Not registered, no error
+}
+
+static int cuobject_pre_register_memory(
+    struct aws_s3_rdma_provider *provider,
+    void *base,
+    size_t size) {
+
+    if (!provider || !base || size == 0) {
+        return AWS_OP_ERR;
+    }
+
+    cuobject_provider *cuobj_provider = reinterpret_cast<cuobject_provider*>(provider);
+    std::lock_guard<std::mutex> lock(cuobj_provider->pre_registered_mutex);
+    auto existing = cuobj_provider->pre_registered_memory.find(base);
+    if (existing != cuobj_provider->pre_registered_memory.end()) {
+        return existing->second >= size ? AWS_OP_SUCCESS : AWS_OP_ERR;
+    }
+
+    cuObjErr_t result = cuobj_provider->client->cuMemObjGetDescriptor(base, size);
+    if (result != CU_OBJ_SUCCESS) {
+        printf("[CUOBJECT_PLUGIN] pre_register_memory: cuMemObjGetDescriptor failed err=%d base=%p size=%zu\n",
+               (int)result, base, size);
+        return AWS_OP_ERR;
+    }
+
+    cuobj_provider->pre_registered_memory.emplace(base, size);
+
+    if (cuobj_provider->config.debug_logging) {
+        printf("[CUOBJECT_PLUGIN] pre_register_memory: registered base=%p size=%zu\n", base, size);
+    }
+    return AWS_OP_SUCCESS;
+}
+
+static int cuobject_release_memory(
+    struct aws_s3_rdma_provider *provider,
+    void *base) {
+
+    if (!provider || !base) {
+        return AWS_OP_ERR;
+    }
+
+    cuobject_provider *cuobj_provider = reinterpret_cast<cuobject_provider*>(provider);
+    std::lock_guard<std::mutex> lock(cuobj_provider->pre_registered_mutex);
+    auto it = cuobj_provider->pre_registered_memory.find(base);
+    if (it == cuobj_provider->pre_registered_memory.end()) {
+        return AWS_OP_SUCCESS;
+    }
+
+    cuObjErr_t result = cuobj_provider->client->cuMemObjPutDescriptor(base);
+    if (result == CU_OBJ_SUCCESS) {
+        cuobj_provider->pre_registered_memory.erase(it);
+    }
+    if (cuobj_provider->config.debug_logging) {
+        printf("[CUOBJECT_PLUGIN] release_memory: base=%p result=%d\n", base, (int)result);
+    }
+    return (result == CU_OBJ_SUCCESS) ? AWS_OP_SUCCESS : AWS_OP_ERR;
+}
+
+static bool cuobject_is_slice_pre_registered(
+    struct aws_s3_rdma_provider *provider,
+    const void *ptr,
+    size_t size) {
+
+    if (!provider || !ptr || size == 0) {
+        return false;
+    }
+
+    cuobject_provider *cuobj_provider = reinterpret_cast<cuobject_provider*>(provider);
+    std::lock_guard<std::mutex> lock(cuobj_provider->pre_registered_mutex);
+    return find_pre_registered_base_locked(cuobj_provider, ptr, size, nullptr, nullptr, nullptr);
 }
 
 /**
@@ -443,10 +584,15 @@ static int cuobject_prepare_put_token(
 
     std::string key_str(reinterpret_cast<const char*>(s3_key->ptr), s3_key->len);
 
-    // For now, assume buffer is the base pointer and offset is 0
-    // This may need adjustment based on actual memory registration patterns
     void *base_ptr = const_cast<void*>(buffer);
     size_t buffer_offset = offset;
+    {
+        std::lock_guard<std::mutex> lock(cuobj_provider->pre_registered_mutex);
+        size_t slice_offset = 0;
+        if (find_pre_registered_base_locked(cuobj_provider, buffer, size, &base_ptr, nullptr, &slice_offset)) {
+            buffer_offset = slice_offset + offset;
+        }
+    }
 
     std::string token = generate_rdma_token_via_cuobject(cuobj_provider, key_str, const_cast<void*>(buffer),
                                                         base_ptr, size, buffer_offset, CUOBJ_PUT);
@@ -463,14 +609,11 @@ static int cuobject_prepare_put_token(
     // This ensures the memory remains valid until the provider is cleaned up
     {
         std::lock_guard<std::mutex> lock(cuobj_provider->tokens_mutex);
-        cuobj_provider->stored_tokens[token] = token;
+        auto insert_result = cuobj_provider->stored_tokens.emplace(token, token);
+        const std::string& stored_token = insert_result.first->second;
+        out_rdma_token->ptr = (uint8_t*)stored_token.c_str();
+        out_rdma_token->len = stored_token.length();
     }
-
-    // Get reference to stored token (safe because map doesn't reallocate existing entries)
-    const std::string& stored_token = cuobj_provider->stored_tokens[token];
-
-    out_rdma_token->ptr = (uint8_t*)stored_token.c_str();
-    out_rdma_token->len = stored_token.length();
 
     if (cuobj_provider->config.debug_logging) {
         printf("[CUOBJECT_PLUGIN] Generated PUT token: %s for key: %s\n", token.c_str(), key_str.c_str());
@@ -498,10 +641,15 @@ static int cuobject_prepare_get_token(
 
     std::string key_str(reinterpret_cast<const char*>(s3_key->ptr), s3_key->len);
 
-    // For now, assume buffer is the base pointer and offset is 0
-    // This may need adjustment based on actual memory registration patterns
     void *base_ptr = buffer;
     size_t buffer_offset = offset;
+    {
+        std::lock_guard<std::mutex> lock(cuobj_provider->pre_registered_mutex);
+        size_t slice_offset = 0;
+        if (find_pre_registered_base_locked(cuobj_provider, buffer, size, &base_ptr, nullptr, &slice_offset)) {
+            buffer_offset = slice_offset + offset;
+        }
+    }
 
     std::string token = generate_rdma_token_via_cuobject(cuobj_provider, key_str, buffer,
                                                         base_ptr, size, buffer_offset, CUOBJ_GET);
@@ -518,14 +666,11 @@ static int cuobject_prepare_get_token(
     // This ensures the memory remains valid until the provider is cleaned up
     {
         std::lock_guard<std::mutex> lock(cuobj_provider->tokens_mutex);
-        cuobj_provider->stored_tokens[token] = token;
+        auto insert_result = cuobj_provider->stored_tokens.emplace(token, token);
+        const std::string& stored_token = insert_result.first->second;
+        out_rdma_token->ptr = (uint8_t*)stored_token.c_str();
+        out_rdma_token->len = stored_token.length();
     }
-
-    // Get reference to stored token (safe because map doesn't reallocate existing entries)
-    const std::string& stored_token = cuobj_provider->stored_tokens[token];
-
-    out_rdma_token->ptr = (uint8_t*)stored_token.c_str();
-    out_rdma_token->len = stored_token.length();
 
     if (cuobj_provider->config.debug_logging) {
         printf("[CUOBJECT_PLUGIN] Generated GET token: %s for key: %s\n", token.c_str(), key_str.c_str());
@@ -575,8 +720,8 @@ static int parse_plugin_config(struct cuobject_plugin_config *out_config) {
     out_config->max_buffer_size = 1024 * 1024 * 1024; // 1GB
     out_config->protocol_version = CUOBJ_PROTO_RDMA_DC_V1;
 
-    // Enable debug logging only if environment variable is set
-    out_config->debug_logging = cuobject_env_flag_enabled("CUOBJECT_DEBUG_LOGGING");
+    out_config->debug_logging = cuobject_env_flag_enabled("CUOBJECT_PLUGIN_DEBUG") ||
+        cuobject_env_flag_enabled("CUOBJECT_DEBUG_LOGGING");
     return AWS_OP_SUCCESS;
 }
 
@@ -700,33 +845,29 @@ static std::string generate_rdma_token_via_cuobject(struct cuobject_provider *pr
 static std::string g_rdma_token_header_name = "x-amz-rdma-token";
 static std::string g_rdma_reply_header_name = "x-amz-rdma-reply";
 static std::string g_rdma_bytes_header_name = "x-amz-rdma-bytes";
-static bool g_header_names_initialized = false;
+static std::once_flag g_header_names_once;
 
 // Initialize header names from environment variables
 static void init_header_names_from_env() {
-    if (g_header_names_initialized) {
-        return;
-    }
-    
-    const char* token_header = std::getenv("CUOBJECT_RDMA_TOKEN_HEADER_NAME");
-    if (token_header && strlen(token_header) > 0) {
-        g_rdma_token_header_name = token_header;
-        printf("[CUOBJECT_PLUGIN] Using custom RDMA token header: %s\n", token_header);
-    }
-    
-    const char* reply_header = std::getenv("CUOBJECT_RDMA_REPLY_HEADER_NAME");
-    if (reply_header && strlen(reply_header) > 0) {
-        g_rdma_reply_header_name = reply_header;
-        printf("[CUOBJECT_PLUGIN] Using custom RDMA reply header: %s\n", reply_header);
-    }
-    
-    const char* bytes_header = std::getenv("CUOBJECT_RDMA_BYTES_HEADER_NAME");
-    if (bytes_header && strlen(bytes_header) > 0) {
-        g_rdma_bytes_header_name = bytes_header;
-        printf("[CUOBJECT_PLUGIN] Using custom RDMA bytes header: %s\n", bytes_header);
-    }
-    
-    g_header_names_initialized = true;
+    std::call_once(g_header_names_once, []() {
+        const char* token_header = std::getenv("CUOBJECT_RDMA_TOKEN_HEADER_NAME");
+        if (token_header && strlen(token_header) > 0) {
+            g_rdma_token_header_name = token_header;
+            printf("[CUOBJECT_PLUGIN] Using custom RDMA token header: %s\n", token_header);
+        }
+
+        const char* reply_header = std::getenv("CUOBJECT_RDMA_REPLY_HEADER_NAME");
+        if (reply_header && strlen(reply_header) > 0) {
+            g_rdma_reply_header_name = reply_header;
+            printf("[CUOBJECT_PLUGIN] Using custom RDMA reply header: %s\n", reply_header);
+        }
+
+        const char* bytes_header = std::getenv("CUOBJECT_RDMA_BYTES_HEADER_NAME");
+        if (bytes_header && strlen(bytes_header) > 0) {
+            g_rdma_bytes_header_name = bytes_header;
+            printf("[CUOBJECT_PLUGIN] Using custom RDMA bytes header: %s\n", bytes_header);
+        }
+    });
 }
 
 // Helper function to create byte cursor from C string without AWS Common dependency
@@ -759,7 +900,7 @@ static struct aws_byte_cursor cuobject_get_rdma_bytes_header_name(struct aws_s3_
 // Plugin vtable
 static const struct aws_s3_rdma_provider_vtable s_cuobject_vtable = {
     .provider_name = "cuObject RDMA Provider",
-    .provider_version = 1,
+    .provider_version = AWS_S3_RDMA_PROVIDER_VERSION_2,
     .init = cuobject_init,
     .cleanup = cuobject_cleanup,
     .register_memory = cuobject_register_memory,
@@ -772,6 +913,9 @@ static const struct aws_s3_rdma_provider_vtable s_cuobject_vtable = {
     .get_rdma_token_header_name = cuobject_get_rdma_token_header_name,
     .get_rdma_reply_header_name = cuobject_get_rdma_reply_header_name,
     .get_rdma_bytes_header_name = cuobject_get_rdma_bytes_header_name,
+    .pre_register_memory = cuobject_pre_register_memory,
+    .release_memory = cuobject_release_memory,
+    .is_slice_pre_registered = cuobject_is_slice_pre_registered,
 };
 
 // Plugin entry point
