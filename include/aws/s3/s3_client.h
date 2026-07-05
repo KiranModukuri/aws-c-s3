@@ -1124,6 +1124,24 @@ struct aws_s3_client *aws_s3_client_acquire(struct aws_s3_client *client);
 AWS_S3_API
 struct aws_s3_client *aws_s3_client_release(struct aws_s3_client *client);
 
+/**
+ * Pre-register an RDMA-capable caller-owned memory range with the client's RDMA provider.
+ * The memory must remain valid until aws_s3_client_release_rdma_buffer() is called.
+ */
+AWS_S3_API
+int aws_s3_client_pre_register_rdma_buffer(
+    struct aws_s3_client *client,
+    void *base,
+    size_t size);
+
+/**
+ * Release a memory range previously registered with aws_s3_client_pre_register_rdma_buffer().
+ */
+AWS_S3_API
+int aws_s3_client_release_rdma_buffer(
+    struct aws_s3_client *client,
+    void *base);
+
 AWS_S3_API
 struct aws_s3_meta_request *aws_s3_client_make_meta_request(
     struct aws_s3_client *client,

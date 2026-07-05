@@ -1168,7 +1168,7 @@ struct aws_future_http_message *s_s3_prepare_upload_part(struct aws_s3_request *
             size_t base_size = meta_request->user_buffer_options.transfer_buffer_size;
             
             /* Validate buffer bounds */
-            if (offset <= base_size && (offset + request_body_size) <= base_size) {
+            if (offset <= base_size && request_body_size <= base_size - (size_t)offset) {
                 uint8_t *ptr = (uint8_t *)base + offset;
                 request->request_body.buffer = ptr;
                 request->request_body.len = request_body_size;  /* For PUT, data is already in buffer */
@@ -1184,7 +1184,8 @@ struct aws_future_http_message *s_s3_prepare_upload_part(struct aws_s3_request *
                     (unsigned long long)offset,
                     request_body_size,
                     base_size);
-                /* Fall back to normal path below */
+                s_s3_prepare_upload_part_finish(part_prep, AWS_ERROR_INVALID_ARGUMENT);
+                return message_future;
             }
         }
         

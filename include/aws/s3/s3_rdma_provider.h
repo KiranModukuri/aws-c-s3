@@ -72,6 +72,9 @@ typedef void aws_s3_rdma_completion_fn(
     int error_code,
     const struct aws_byte_cursor *rdma_reply_token);
 
+#define AWS_S3_RDMA_PROVIDER_VERSION_1 1u
+#define AWS_S3_RDMA_PROVIDER_VERSION_2 2u
+
 /**
  * @brief RDMA provider vtable interface
  * 
@@ -121,7 +124,7 @@ struct aws_s3_rdma_provider_vtable {
     int (*deregister_memory)(
         struct aws_s3_rdma_provider *provider,
         void *ptr);
-    
+
     /**
      * Check if memory is suitable for RDMA operations
      * @param provider Provider instance
@@ -217,6 +220,21 @@ struct aws_s3_rdma_provider_vtable {
      */
     struct aws_byte_cursor (*get_rdma_bytes_header_name)(
         struct aws_s3_rdma_provider *provider);
+
+    /* Version 2: register a caller-owned base allocation once and reuse its slices. */
+    int (*pre_register_memory)(
+        struct aws_s3_rdma_provider *provider,
+        void *base,
+        size_t size);
+
+    int (*release_memory)(
+        struct aws_s3_rdma_provider *provider,
+        void *base);
+
+    bool (*is_slice_pre_registered)(
+        struct aws_s3_rdma_provider *provider,
+        const void *ptr,
+        size_t size);
 };
 
 /**
@@ -472,6 +490,23 @@ AWS_S3_API
 int aws_s3_rdma_provider_deregister_memory(
     struct aws_s3_rdma_provider *provider,
     void *ptr);
+
+AWS_S3_API
+int aws_s3_rdma_provider_pre_register_memory(
+    struct aws_s3_rdma_provider *provider,
+    void *base,
+    size_t size);
+
+AWS_S3_API
+int aws_s3_rdma_provider_release_memory(
+    struct aws_s3_rdma_provider *provider,
+    void *base);
+
+AWS_S3_API
+bool aws_s3_rdma_provider_is_slice_pre_registered(
+    struct aws_s3_rdma_provider *provider,
+    const void *ptr,
+    size_t size);
 
 /**
  * Prepare RDMA token for PUT operation
@@ -739,4 +774,4 @@ AWS_EXTERN_C_END
 
 AWS_POP_SANE_WARNING_LEVEL
 
-#endif /* AWS_S3_RDMA_PROVIDER_H */ 
+#endif /* AWS_S3_RDMA_PROVIDER_H */

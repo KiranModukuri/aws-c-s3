@@ -823,11 +823,14 @@ static void s_s3_meta_request_on_request_prepared(void *user_data) {
     if (client && client->rdma_request_handler) {
         int rdma_result = aws_s3_rdma_request_handler_prepare_request(client->rdma_request_handler, meta_request, request);
         if (rdma_result != AWS_OP_SUCCESS) {
+            int rdma_error = aws_last_error_or_unknown();
             AWS_LOGF_ERROR(
                 AWS_LS_S3_META_REQUEST,
-                "id=%p RDMA preparation failed, aborting request to trigger retry with HTTP",
-                (void *)meta_request);
-            s_s3_prepare_request_payload_callback_and_destroy(payload, rdma_result);
+                "id=%p RDMA preparation failed, aborting request before HTTP fallback (error=%d %s)",
+                (void *)meta_request,
+                rdma_error,
+                aws_error_str(rdma_error));
+            s_s3_prepare_request_payload_callback_and_destroy(payload, rdma_error);
             return;
         }
     }

@@ -24,7 +24,13 @@
 #include <aws/common/clock.h>
 #include <aws/testing/aws_test_harness.h>
 #include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
+
+static bool s_rdma_explicitly_disabled(void) {
+    const char *enabled = getenv("AWS_S3_RDMA_ENABLED");
+    return enabled && (strcmp(enabled, "0") == 0 || strcmp(enabled, "false") == 0);
+}
 
 /**
  * Basic User Buffer Tests (no explicit RDMA flag)
@@ -138,6 +144,10 @@ AWS_TEST_CASE(test_s3_get_user_buffer_smaller_than_part_size, s_test_s3_get_user
 static int s_test_s3_get_user_buffer_smaller_than_part_size(struct aws_allocator *allocator, void *ctx) {
     (void)ctx;
 
+    if (s_rdma_explicitly_disabled()) {
+        return AWS_OP_SKIP;
+    }
+
     struct aws_s3_tester tester;
     ASSERT_SUCCESS(aws_s3_tester_init(allocator, &tester));
 
@@ -250,6 +260,10 @@ static int s_test_s3_get_user_buffer_smaller_than_part_size(struct aws_allocator
 AWS_TEST_CASE(test_s3_get_user_buffer_non_multiple_of_part_size, s_test_s3_get_user_buffer_non_multiple_of_part_size)
 static int s_test_s3_get_user_buffer_non_multiple_of_part_size(struct aws_allocator *allocator, void *ctx) {
     (void)ctx;
+
+    if (s_rdma_explicitly_disabled()) {
+        return AWS_OP_SKIP;
+    }
 
     struct aws_s3_tester tester;
     ASSERT_SUCCESS(aws_s3_tester_init(allocator, &tester));
@@ -421,6 +435,10 @@ AWS_TEST_CASE(test_s3_put_user_buffer_rdma_multipart, s_test_s3_put_user_buffer_
 static int s_test_s3_put_user_buffer_rdma_multipart(struct aws_allocator *allocator, void *ctx) {
     (void)ctx;
 
+    if (s_rdma_explicitly_disabled()) {
+        return AWS_OP_SKIP;
+    }
+
     struct aws_s3_tester tester;
     ASSERT_SUCCESS(aws_s3_tester_init(allocator, &tester));
 
@@ -490,6 +508,10 @@ AWS_TEST_CASE(test_s3_put_user_buffer_rdma_crc32, s_test_s3_put_user_buffer_rdma
 static int s_test_s3_put_user_buffer_rdma_crc32(struct aws_allocator *allocator, void *ctx) {
     (void)ctx;
 
+    if (s_rdma_explicitly_disabled()) {
+        return AWS_OP_SKIP;
+    }
+
     struct aws_s3_tester tester;
     ASSERT_SUCCESS(aws_s3_tester_init(allocator, &tester));
 
@@ -558,6 +580,10 @@ static int s_test_s3_put_user_buffer_rdma_crc32(struct aws_allocator *allocator,
 AWS_TEST_CASE(test_s3_put_user_buffer_rdma_crc32c_multipart, s_test_s3_put_user_buffer_rdma_crc32c_multipart)
 static int s_test_s3_put_user_buffer_rdma_crc32c_multipart(struct aws_allocator *allocator, void *ctx) {
     (void)ctx;
+
+    if (s_rdma_explicitly_disabled()) {
+        return AWS_OP_SKIP;
+    }
 
     struct aws_s3_tester tester;
     ASSERT_SUCCESS(aws_s3_tester_init(allocator, &tester));
@@ -700,6 +726,17 @@ static int s_test_s3_user_buffer_put_get_roundtrip(struct aws_allocator *allocat
     }
     put_buffer.len = object_size;
 
+    if (aws_s3_client_pre_register_rdma_buffer(client, put_buffer.buffer, put_buffer.len)) {
+        int error_code = aws_last_error();
+        aws_byte_buf_clean_up(&put_buffer);
+        client = aws_s3_client_release(client);
+        aws_s3_tester_clean_up(&tester);
+        if (error_code == AWS_ERROR_INVALID_ARGUMENT || error_code == AWS_ERROR_UNIMPLEMENTED) {
+            return AWS_OP_SKIP;
+        }
+        return aws_raise_error(error_code);
+    }
+
     uint64_t timestamp;
     aws_high_res_clock_get_ticks(&timestamp);
     char object_path_buffer[128];
@@ -733,6 +770,7 @@ static int s_test_s3_user_buffer_put_get_roundtrip(struct aws_allocator *allocat
     };
 
     ASSERT_SUCCESS(aws_s3_tester_send_meta_request_with_options(&tester, &put_options, NULL));
+    ASSERT_SUCCESS(aws_s3_client_release_rdma_buffer(client, put_buffer.buffer));
 
     aws_http_message_release(put_message);
 
@@ -742,6 +780,7 @@ static int s_test_s3_user_buffer_put_get_roundtrip(struct aws_allocator *allocat
 
     /* Poison buffer to verify data actually gets written */
     memset(get_buffer.buffer, 0xDE, object_size);
+    ASSERT_SUCCESS(aws_s3_client_pre_register_rdma_buffer(client, get_buffer.buffer, get_buffer.capacity));
 
     struct aws_s3_user_buffer_options get_user_buffer_options = {
         .transfer_buffer = get_buffer.buffer,
@@ -765,6 +804,7 @@ static int s_test_s3_user_buffer_put_get_roundtrip(struct aws_allocator *allocat
     };
 
     ASSERT_SUCCESS(aws_s3_tester_send_meta_request_with_options(&tester, &get_options, &test_results));
+    ASSERT_SUCCESS(aws_s3_client_release_rdma_buffer(client, get_buffer.buffer));
 
     /* Verify data integrity */
     ASSERT_UINT_EQUALS(object_size, test_results.received_body_size);
@@ -797,8 +837,8 @@ static int s_test_s3_user_buffer_too_small_error(struct aws_allocator *allocator
     struct aws_s3_client *client = aws_s3_client_new(allocator, &client_config);
     ASSERT_TRUE(client != NULL);
 
-    /* Buffer too small for 1MB object */
-    size_t buffer_size = 512 * 1024; // 512KB
+    /* Buffer too small for the 10MB GET and every multipart PUT part. */
+    size_t buffer_size = 1024 * 1024;
     struct aws_byte_buf user_buffer;
     aws_byte_buf_init(&user_buffer, allocator, buffer_size);
 
@@ -814,13 +854,33 @@ static int s_test_s3_user_buffer_too_small_error(struct aws_allocator *allocator
         .validate_type = AWS_S3_TESTER_VALIDATE_TYPE_EXPECT_FAILURE,
         .get_options =
             {
-                .object_path = aws_byte_cursor_from_c_str("/pre-existing-1MB"),
+                .object_path = aws_byte_cursor_from_c_str("/pre-existing-10MB"),
             },
         .user_buffer_options = &user_buffer_options,
+        .use_rdma = true,
     };
 
     /* Should fail due to buffer size */
     ASSERT_SUCCESS(aws_s3_tester_send_meta_request_with_options(&tester, &options, NULL));
+
+    struct aws_http_message *put_message = aws_s3_test_put_object_request_new_without_body(
+        allocator,
+        &g_test_endpoint,
+        g_test_body_content_type,
+        aws_byte_cursor_from_c_str("/user-buffer-too-small"),
+        21 * 1024 * 1024,
+        0);
+    struct aws_s3_tester_meta_request_options put_options = {
+        .allocator = allocator,
+        .meta_request_type = AWS_S3_META_REQUEST_TYPE_PUT_OBJECT,
+        .validate_type = AWS_S3_TESTER_VALIDATE_TYPE_EXPECT_FAILURE,
+        .message = put_message,
+        .client = client,
+        .user_buffer_options = &user_buffer_options,
+        .use_rdma = true,
+    };
+    ASSERT_SUCCESS(aws_s3_tester_send_meta_request_with_options(&tester, &put_options, NULL));
+    aws_http_message_release(put_message);
 
     aws_byte_buf_clean_up(&user_buffer);
     client = aws_s3_client_release(client);
@@ -828,4 +888,3 @@ static int s_test_s3_user_buffer_too_small_error(struct aws_allocator *allocator
 
     return 0;
 }
-

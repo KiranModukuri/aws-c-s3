@@ -216,6 +216,47 @@ int aws_s3_rdma_provider_deregister_memory(
     return provider->vtable->deregister_memory(provider->provider_instance, ptr);
 }
 
+int aws_s3_rdma_provider_pre_register_memory(
+    struct aws_s3_rdma_provider *provider,
+    void *base,
+    size_t size) {
+
+    if (!provider || !provider->vtable ||
+        provider->vtable->provider_version < AWS_S3_RDMA_PROVIDER_VERSION_2 ||
+        !provider->vtable->pre_register_memory) {
+        return aws_raise_error(AWS_ERROR_UNIMPLEMENTED);
+    }
+
+    return provider->vtable->pre_register_memory(provider->provider_instance, base, size);
+}
+
+int aws_s3_rdma_provider_release_memory(
+    struct aws_s3_rdma_provider *provider,
+    void *base) {
+
+    if (!provider || !provider->vtable ||
+        provider->vtable->provider_version < AWS_S3_RDMA_PROVIDER_VERSION_2 ||
+        !provider->vtable->release_memory) {
+        return aws_raise_error(AWS_ERROR_UNIMPLEMENTED);
+    }
+
+    return provider->vtable->release_memory(provider->provider_instance, base);
+}
+
+bool aws_s3_rdma_provider_is_slice_pre_registered(
+    struct aws_s3_rdma_provider *provider,
+    const void *ptr,
+    size_t size) {
+
+    if (!provider || !provider->vtable ||
+        provider->vtable->provider_version < AWS_S3_RDMA_PROVIDER_VERSION_2 ||
+        !provider->vtable->is_slice_pre_registered) {
+        return false;
+    }
+
+    return provider->vtable->is_slice_pre_registered(provider->provider_instance, ptr, size);
+}
+
 int aws_s3_rdma_provider_prepare_put_token(
     struct aws_s3_rdma_provider *provider,
     const struct aws_byte_cursor *s3_key,
@@ -293,4 +334,4 @@ struct aws_byte_cursor aws_s3_rdma_provider_get_rdma_bytes_header_name(
     }
     
     return provider->vtable->get_rdma_bytes_header_name(provider->provider_instance);
-} 
+}

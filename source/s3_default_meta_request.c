@@ -304,6 +304,7 @@ static struct aws_future_void *s_s3_default_prepare_request(struct aws_s3_reques
             request->send_data.response_body.buffer = meta_request->user_buffer_options.transfer_buffer;
             request->send_data.response_body.len = 0;
             request->send_data.response_body.capacity = meta_request->user_buffer_options.transfer_buffer_size;
+            request->is_user_provided_buffer = 1;
         /* Note: rdma_buffer_registered will be set during buffer registration */
         }
     }
