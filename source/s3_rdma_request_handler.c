@@ -268,7 +268,31 @@ static void s_extract_rdma_buffer_info_for_put(
         return;
     }
 
-    /* Fall back to body stream check */
+    /* Prefer the raw request_body byte_buf over checking body-stream.
+     *
+     * request->request_body is the raw, un-wrapped byte_buf holding the
+     * actual payload bytes RDMA needs. It is populated for:
+     *   - file uploads (send_filepath): set by the read_part step
+     *   - async writes / BytesIO: set when the buffer is provided
+     *   - user-supplied buffers: set when the part is mapped
+     * Use it directly whenever available; the body-stream branch below is
+     * kept only as a last resort for pure streaming uploads where
+     * request_body never gets populated. */
+    if (request->request_body.buffer && request->request_body.len > 0) {
+        buffer_info->buffer = request->request_body.buffer;
+        buffer_info->size = request->request_body.len;
+        buffer_info->is_eligible = (buffer_info->size >= client->rdma_min_transfer_size);
+        AWS_LOGF_DEBUG(
+            AWS_LS_S3_META_REQUEST,
+            "id=%p RDMA buffer check (request_body): eligible=%d, size=%zu, threshold=%zu",
+            (void *)meta_request,
+            buffer_info->is_eligible,
+            buffer_info->size,
+            client->rdma_min_transfer_size);
+        return;
+    }
+
+    // Fall back to body-stream checking only when request_body is absent
     if (request->send_data.message && aws_http_message_get_body_stream(request->send_data.message)) {
         struct aws_input_stream *body_stream = aws_http_message_get_body_stream(request->send_data.message);
 
@@ -276,7 +300,7 @@ static void s_extract_rdma_buffer_info_for_put(
         if (aws_input_stream_get_length(body_stream, &stream_length) == AWS_OP_SUCCESS && stream_length >= 0) {
             buffer_info->size = (size_t)stream_length;
 
-            /* Try to extract buffer pointer from cursor-based stream (BytesIO) */
+	     /* Try to extract buffer pointer from cursor-based stream (BytesIO) */
             if (body_stream->impl) {
                 /* Define the cursor stream structure locally to match aws-c-io/source/stream.c */
                 struct aws_input_stream_byte_cursor_impl {
@@ -310,28 +334,6 @@ static void s_extract_rdma_buffer_info_for_put(
         } else {
             AWS_LOGF_DEBUG(AWS_LS_S3_META_REQUEST, "id=%p PUT stream length unknown", (void *)meta_request);
         }
-        return;
-    }
-
-    /* Check if request body is already available (async writes, file uploads after read) */
-    if (request->request_body.buffer && request->request_body.len > 0) {
-        buffer_info->buffer = request->request_body.buffer;
-        
-        /* By this point, len is always correct:
-         * - Async writes: len was set when buffer was provided
-         * - File uploads: len was set after file read completed
-         * - User buffers: len was set when buffer was mapped
-         * - Empty files: len = 0 (this branch not taken) */
-        buffer_info->size = request->request_body.len;
-        
-        buffer_info->is_eligible = (buffer_info->size >= client->rdma_min_transfer_size);
-        AWS_LOGF_DEBUG(
-            AWS_LS_S3_META_REQUEST, 
-            "id=%p RDMA buffer check: eligible=%d, size=%zu, threshold=%zu",
-            (void *)meta_request,
-            buffer_info->is_eligible,
-            buffer_info->size,
-            client->rdma_min_transfer_size);
         return;
     }
 
