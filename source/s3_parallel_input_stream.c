@@ -124,8 +124,8 @@ static void s_s3_parallel_from_file_read_task(struct aws_task *task, void *arg, 
         size_t page_size = aws_system_info_page_size();
         uint8_t *buffer_ptr = read_task->dest->buffer + read_task->dest->len;
 
-        /* Direct I/O requires buffer address to be page-aligned */
-        if ((uintptr_t)buffer_ptr % page_size == 0) {
+        // Direct requires the buffer address and the read length to be aligned to filesystem block size
+        if ((uintptr_t)buffer_ptr % page_size == 0 && read_task->length % page_size == 0) {
             can_use_direct_io = true;
         }
     }
