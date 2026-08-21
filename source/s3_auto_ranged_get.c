@@ -530,9 +530,12 @@ static int s_prepare_rdma_for_get_request(
         }
     }
 
-    /* RDMA ENHANCEMENT: Pre-allocate response buffers and generate RDMA tokens for GET requests */
+    /* RDMA ENHANCEMENT: Pre-allocate response buffers and generate RDMA tokens for GET requests.
+     * User-buffer requests are handled later by the consolidated RDMA request handler. Handling
+     * them here too duplicates registration/token generation and breaks application-owned pins. */
     struct aws_s3_client *client = meta_request->client;
     if (client && client->enable_rdma && client->rdma_provider && meta_request->use_rdma &&
+        !meta_request->user_buffer_options.transfer_buffer &&
         (request->request_tag == AWS_S3_AUTO_RANGE_GET_REQUEST_TYPE_GET_OBJECT_WITH_RANGE ||
          request->request_tag == AWS_S3_AUTO_RANGE_GET_REQUEST_TYPE_GET_OBJECT_WITH_PART_NUMBER_1)) {
 

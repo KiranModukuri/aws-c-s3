@@ -60,9 +60,9 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <sstream>
 #include <cstring>
-#include <atomic>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -72,6 +72,9 @@
 #include <stdlib.h>
 #include <strings.h>
 #include <vector>
+#if USE_CUDA
+#include <cuda_runtime.h>
+#endif
 
 extern "C" {
 
@@ -90,18 +93,12 @@ struct cuobject_provider {
     /* Memory registration tracking */
     std::unordered_map<void*, size_t> registered_memory;
     std::mutex memory_mutex;
-
-    /* RDMA token tracking */
-    std::unordered_map<std::string, void*> pending_operations;
-    std::mutex operations_mutex;
-
-    /* Token storage for memory lifecycle management */
-    std::unordered_map<std::string, std::string> stored_tokens;
-    std::mutex tokens_mutex;
-
-    /* Token counter for unique IDs */
-    std::atomic<uint64_t> token_counter;
 };
+
+/* prepare_*_token() returns a cursor which is consumed synchronously by
+ * aws_http_headers_set(). That API copies the header value, so storage only
+ * needs to survive until the next provider call on this thread. */
+static thread_local std::string s_token_scratch;
 
 /**
  * Context for cuObjClient callbacks
@@ -132,6 +129,45 @@ struct cuobject_operation_context {
 static int parse_plugin_config(struct cuobject_plugin_config *out_config);
 static std::string generate_rdma_token_via_cuobject(struct cuobject_provider *provider, const std::string &s3_key,
                                                    void *buffer, void *base_ptr, size_t size, size_t buffer_offset, cuObjOpType_t op_type);
+
+/**
+ * Attach the owning device's primary CUDA context to the calling thread.
+ *
+ * CRT prepares requests on event-loop threads, which never had a CUDA context
+ * made current. cuFileBufRegister cannot pin device memory without one, so
+ * registration of a cudaMalloc pointer fails there while the same pointer
+ * registers fine from the application's own thread. Host pointers are
+ * unaffected and are left alone.
+ */
+static void cuobject_bind_cuda_context(const void *ptr) {
+#if USE_CUDA
+    if (!ptr) {
+        return;
+    }
+
+    cudaPointerAttributes attr;
+    memset(&attr, 0, sizeof(attr));
+    if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
+        cudaGetLastError();
+        return;
+    }
+    if (attr.type != cudaMemoryTypeDevice && attr.type != cudaMemoryTypeManaged) {
+        return;
+    }
+
+    if (cudaSetDevice(attr.device) != cudaSuccess) {
+        cudaGetLastError();
+        return;
+    }
+    /* cudaSetDevice only records the device; this forces the primary context to
+     * actually be created and bound to this thread. */
+    if (cudaFree(nullptr) != cudaSuccess) {
+        cudaGetLastError();
+    }
+#else
+    (void)ptr;
+#endif
+}
 
 static bool cuobject_env_flag_enabled(const char *name) {
     const char *value = std::getenv(name);
@@ -257,7 +293,6 @@ static int cuobject_init(
     try {
         auto provider = std::make_unique<cuobject_provider>();
         provider->allocator = allocator;
-        provider->token_counter = 1;
 
         // Parse configuration
         if (parse_plugin_config(&provider->config) != AWS_OP_SUCCESS) {
@@ -279,7 +314,7 @@ static int cuobject_init(
         }
 
         if (provider->config.debug_logging) {
-        printf("[CUOBJECT_PLUGIN] Initialized cuObject provider\n");
+            printf("[CUOBJECT_PLUGIN] Initialized cuObject provider\n");
         }
 
         *out_provider = reinterpret_cast<struct aws_s3_rdma_provider*>(provider.release());
@@ -318,6 +353,8 @@ static int cuobject_register_memory(
     }
 
     cuobject_provider *cuobj_provider = reinterpret_cast<cuobject_provider*>(provider);
+
+    cuobject_bind_cuda_context(ptr);
 
     // Check memory type
     cuObjMemoryType_t mem_type = cuObjClient::getMemoryType(ptr);
@@ -359,6 +396,8 @@ static int cuobject_deregister_memory(
     }
 
     cuobject_provider *cuobj_provider = reinterpret_cast<cuobject_provider*>(provider);
+
+    cuobject_bind_cuda_context(ptr);
 
     {
         std::lock_guard<std::mutex> lock(cuobj_provider->memory_mutex);
@@ -459,21 +498,15 @@ static int cuobject_prepare_put_token(
         return AWS_OP_ERR; // AWS CRT will fall back to HTTP transfer
     }
 
-    // Store token in provider instance for proper lifecycle management
-    // This ensures the memory remains valid until the provider is cleaned up
-    {
-        std::lock_guard<std::mutex> lock(cuobj_provider->tokens_mutex);
-        cuobj_provider->stored_tokens[token] = token;
-    }
-
-    // Get reference to stored token (safe because map doesn't reallocate existing entries)
-    const std::string& stored_token = cuobj_provider->stored_tokens[token];
-
-    out_rdma_token->ptr = (uint8_t*)stored_token.c_str();
-    out_rdma_token->len = stored_token.length();
+    s_token_scratch = std::move(token);
+    out_rdma_token->ptr = (uint8_t*)s_token_scratch.data();
+    out_rdma_token->len = s_token_scratch.length();
 
     if (cuobj_provider->config.debug_logging) {
-        printf("[CUOBJECT_PLUGIN] Generated PUT token: %s for key: %s\n", token.c_str(), key_str.c_str());
+        printf(
+            "[CUOBJECT_PLUGIN] Generated PUT token: %s for key: %s\n",
+            s_token_scratch.c_str(),
+            key_str.c_str());
     }
 
     return AWS_OP_SUCCESS;
@@ -514,21 +547,15 @@ static int cuobject_prepare_get_token(
         return AWS_OP_ERR; // AWS CRT will fall back to HTTP transfer
     }
 
-    // Store token in provider instance for proper lifecycle management
-    // This ensures the memory remains valid until the provider is cleaned up
-    {
-        std::lock_guard<std::mutex> lock(cuobj_provider->tokens_mutex);
-        cuobj_provider->stored_tokens[token] = token;
-    }
-
-    // Get reference to stored token (safe because map doesn't reallocate existing entries)
-    const std::string& stored_token = cuobj_provider->stored_tokens[token];
-
-    out_rdma_token->ptr = (uint8_t*)stored_token.c_str();
-    out_rdma_token->len = stored_token.length();
+    s_token_scratch = std::move(token);
+    out_rdma_token->ptr = (uint8_t*)s_token_scratch.data();
+    out_rdma_token->len = s_token_scratch.length();
 
     if (cuobj_provider->config.debug_logging) {
-        printf("[CUOBJECT_PLUGIN] Generated GET token: %s for key: %s\n", token.c_str(), key_str.c_str());
+        printf(
+            "[CUOBJECT_PLUGIN] Generated GET token: %s for key: %s\n",
+            s_token_scratch.c_str(),
+            key_str.c_str());
     }
 
     return AWS_OP_SUCCESS;
@@ -612,6 +639,9 @@ static std::string generate_rdma_token_via_cuobject(struct cuobject_provider *pr
         return ""; // Return empty string to indicate failure
     }
 
+    /* cuObjPut/cuObjGet reach cuFile with this pointer; same context requirement. */
+    cuobject_bind_cuda_context(base_ptr);
+
     try {
         // Call cuObjClient operation with registered base pointer and buffer offset
         ssize_t result;
@@ -674,12 +704,6 @@ static std::string generate_rdma_token_via_cuobject(struct cuobject_provider *pr
             // Callbacks now ensure correct length without NULL terminator issues
             std::string rdma_token = std::string(ctx->rdma_info.desc_str, ctx->rdma_info.desc_len);
 
-            // Store operation context for later retrieval
-            {
-                std::lock_guard<std::mutex> lock(provider->operations_mutex);
-                provider->pending_operations[rdma_token] = buffer;
-            }
-
             return rdma_token;
         } else {
             if (provider->config.debug_logging) {
@@ -707,25 +731,25 @@ static void init_header_names_from_env() {
     if (g_header_names_initialized) {
         return;
     }
-    
+
     const char* token_header = std::getenv("CUOBJECT_RDMA_TOKEN_HEADER_NAME");
     if (token_header && strlen(token_header) > 0) {
         g_rdma_token_header_name = token_header;
         printf("[CUOBJECT_PLUGIN] Using custom RDMA token header: %s\n", token_header);
     }
-    
+
     const char* reply_header = std::getenv("CUOBJECT_RDMA_REPLY_HEADER_NAME");
     if (reply_header && strlen(reply_header) > 0) {
         g_rdma_reply_header_name = reply_header;
         printf("[CUOBJECT_PLUGIN] Using custom RDMA reply header: %s\n", reply_header);
     }
-    
+
     const char* bytes_header = std::getenv("CUOBJECT_RDMA_BYTES_HEADER_NAME");
     if (bytes_header && strlen(bytes_header) > 0) {
         g_rdma_bytes_header_name = bytes_header;
         printf("[CUOBJECT_PLUGIN] Using custom RDMA bytes header: %s\n", bytes_header);
     }
-    
+
     g_header_names_initialized = true;
 }
 
