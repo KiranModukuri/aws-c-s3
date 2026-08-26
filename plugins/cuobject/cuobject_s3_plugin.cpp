@@ -724,33 +724,29 @@ static std::string generate_rdma_token_via_cuobject(struct cuobject_provider *pr
 static std::string g_rdma_token_header_name = "x-amz-rdma-token";
 static std::string g_rdma_reply_header_name = "x-amz-rdma-reply";
 static std::string g_rdma_bytes_header_name = "x-amz-rdma-bytes";
-static bool g_header_names_initialized = false;
+static std::once_flag g_header_names_once;
 
 // Initialize header names from environment variables
 static void init_header_names_from_env() {
-    if (g_header_names_initialized) {
-        return;
-    }
+    std::call_once(g_header_names_once, []() {
+        const char* token_header = std::getenv("CUOBJECT_RDMA_TOKEN_HEADER_NAME");
+        if (token_header && strlen(token_header) > 0) {
+            g_rdma_token_header_name = token_header;
+            printf("[CUOBJECT_PLUGIN] Using custom RDMA token header: %s\n", token_header);
+        }
 
-    const char* token_header = std::getenv("CUOBJECT_RDMA_TOKEN_HEADER_NAME");
-    if (token_header && strlen(token_header) > 0) {
-        g_rdma_token_header_name = token_header;
-        printf("[CUOBJECT_PLUGIN] Using custom RDMA token header: %s\n", token_header);
-    }
+        const char* reply_header = std::getenv("CUOBJECT_RDMA_REPLY_HEADER_NAME");
+        if (reply_header && strlen(reply_header) > 0) {
+            g_rdma_reply_header_name = reply_header;
+            printf("[CUOBJECT_PLUGIN] Using custom RDMA reply header: %s\n", reply_header);
+        }
 
-    const char* reply_header = std::getenv("CUOBJECT_RDMA_REPLY_HEADER_NAME");
-    if (reply_header && strlen(reply_header) > 0) {
-        g_rdma_reply_header_name = reply_header;
-        printf("[CUOBJECT_PLUGIN] Using custom RDMA reply header: %s\n", reply_header);
-    }
-
-    const char* bytes_header = std::getenv("CUOBJECT_RDMA_BYTES_HEADER_NAME");
-    if (bytes_header && strlen(bytes_header) > 0) {
-        g_rdma_bytes_header_name = bytes_header;
-        printf("[CUOBJECT_PLUGIN] Using custom RDMA bytes header: %s\n", bytes_header);
-    }
-
-    g_header_names_initialized = true;
+        const char* bytes_header = std::getenv("CUOBJECT_RDMA_BYTES_HEADER_NAME");
+        if (bytes_header && strlen(bytes_header) > 0) {
+            g_rdma_bytes_header_name = bytes_header;
+            printf("[CUOBJECT_PLUGIN] Using custom RDMA bytes header: %s\n", bytes_header);
+        }
+    });
 }
 
 // Helper function to create byte cursor from C string without AWS Common dependency
