@@ -309,7 +309,8 @@ static void s_initialize_rdma_components(
     if (env_threshold) {
         char *endptr;
         unsigned long threshold_val = strtoul(env_threshold, &endptr, 10);
-        if (*endptr == '\0' && threshold_val > 0) {
+        /* 0 is valid: force RDMA for all sizes (bench / small-IO path). */
+        if (*endptr == '\0') {
             rdma_threshold = (size_t)threshold_val;
             threshold_from_env = true;
         } else {

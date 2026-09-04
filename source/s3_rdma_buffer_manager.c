@@ -87,6 +87,7 @@ static int s_default_prepare_buffer_for_rdma(
     int register_result = aws_s3_rdma_provider_register_memory(manager->rdma_provider, buffer, buffer_size);
     if (register_result == AWS_OP_SUCCESS) {
         request->rdma_buffer_registered = 1;
+        request->rdma_buffer_owned_by_request = 1;
         AWS_LOGF_DEBUG(
             AWS_LS_S3_RDMA,
             "id=%p Successfully registered buffer for RDMA: %p (size: %zu)",
@@ -117,6 +118,13 @@ static int s_default_finalize_buffer(
         AWS_LOGF_DEBUG(AWS_LS_S3_RDMA, "id=%p No buffer registered for request", (void *)manager);
         return AWS_OP_SUCCESS;
     }
+
+    /* The application owns buffers supplied with buffer_is_rdma_registered.
+     * Clear this request's state without releasing the persistent registration. */
+    if (!request->rdma_buffer_owned_by_request) {
+        request->rdma_buffer_registered = 0;
+        return AWS_OP_SUCCESS;
+    }
     
     /* Get buffer from request */
     void *buffer = NULL;
@@ -135,12 +143,14 @@ static int s_default_finalize_buffer(
         AWS_LOGF_WARN(AWS_LS_S3_RDMA, "id=%p No buffer found for finalization (request_type=%d, request_body_buffer=%p)", 
                      (void *)manager, request->request_type, request->request_body.buffer);
         request->rdma_buffer_registered = 0; /* Clear flag anyway */
+        request->rdma_buffer_owned_by_request = 0;
         return AWS_OP_SUCCESS;
     }
     
     /* Deregister buffer */
     int result = aws_s3_rdma_provider_deregister_memory(manager->rdma_provider, buffer);
     request->rdma_buffer_registered = 0; /* Clear flag regardless of result */
+    request->rdma_buffer_owned_by_request = 0;
     
     if (result == AWS_OP_SUCCESS) {
         AWS_LOGF_DEBUG(

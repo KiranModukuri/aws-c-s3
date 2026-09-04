@@ -292,6 +292,9 @@ struct aws_s3_request {
     /* When true, this request's buffer has been registered for RDMA and is eligible for RDMA operations */
     uint32_t rdma_buffer_registered : 1;
 
+    /* When true, CRT registered the buffer and must deregister it. False for application-owned pre-registration. */
+    uint32_t rdma_buffer_owned_by_request : 1;
+
     /* When true, the server completed RDMA transfer (detected via response headers: x-rdma-reply or x-rdma-bytes) */
     uint32_t rdma_transfer_succeeded : 1;
 
