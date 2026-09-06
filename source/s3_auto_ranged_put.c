@@ -1398,7 +1398,7 @@ static void s_s3_prepare_upload_part_finish(struct aws_s3_prepare_upload_part_jo
         message = aws_s3_upload_part_message_new(
             meta_request->allocator,
             meta_request->initial_request_message,
-            is_rdma_request ? NULL : &request->request_body,  /* Skip HTTP body assignment for RDMA */
+            &request->request_body,  // Always attach body; RDMA path detaches it after token generation. refer to s_prepare_rdma_put_headers
             request->part_number,
             auto_ranged_put->upload_id,
             meta_request->should_compute_content_md5,

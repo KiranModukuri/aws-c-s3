@@ -439,10 +439,10 @@ struct aws_http_message *aws_s3_upload_part_message_new(
         goto error_clean_up;
     }
 
-    /* For RDMA requests, skip HTTP body assignment */
-    if (buffer == NULL) {
-        return message;
-    }
+    /* The body buffer is always provided.
+     * This holud revents AWS_ERROR_HTTP_MISSING_BODY_STREAM when the RDMA path
+     * declines or fails, and gives a clean HTTP fallback on the first attempt. 
+     */
     if (aws_s3_message_util_assign_body(allocator, buffer, NULL /*body_stream*/, message, checksum_context) == NULL) {
         goto error_clean_up;
     }

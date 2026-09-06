@@ -426,9 +426,13 @@ static void s_s3_default_prepare_request_finish(
             request->rdma_buffer_registered = 0;
         }
 
-        if (!will_use_rdma) {
-            aws_s3_message_util_assign_body(meta_request->allocator, &request->request_body, NULL, message, checksum_context);
-        }
+        /* Always attach the body. We will detaches the body stream and zeroes
+         * Content-Length inside s_prepare_rdma_put_headers after the token has
+         * been generated. If RDMA is enabled but the plugin failed to load (so the
+         * provider is NULL and token gen silently no-ops), the body stays attached
+         * and HTTP fallback works on the first attempt instead of raising
+         * AWS_ERROR_HTTP_MISSING_BODY_STREAM. */
+        aws_s3_message_util_assign_body(meta_request->allocator, &request->request_body, NULL, message, checksum_context);
 
         /* Release the context reference */
         aws_s3_upload_request_checksum_context_release(checksum_context);

@@ -1772,6 +1772,39 @@ void aws_s3_meta_request_send_request_finish_default(
         }
     }
 
+    /* Server declined an RDMA PUT/UPLOAD_PART: retry over plain HTTP (TCP).
+     * if (put and http->respone_status==501 and (x-amz-rdma-reply==501 or absent x-amz-rdma-reply) =>retry
+     */
+    if (error_code != AWS_ERROR_SUCCESS && /* the request failed */
+        response_status == AWS_HTTP_STATUS_CODE_501_NOT_IMPLEMENTED && /* with HTTP 501 NotImplemented */
+        meta_request->use_rdma && !request->disable_rdma_on_retry && /* on an RDMA attempt not yet downgraded */
+        (request->request_type == AWS_S3_REQUEST_TYPE_PUT_OBJECT ||
+         request->request_type == AWS_S3_REQUEST_TYPE_UPLOAD_PART)) {
+
+        bool rdma_reply_absent_or_501 = true;
+        if (request->send_data.response_headers != NULL && client->rdma_provider != NULL) {
+            struct aws_byte_cursor rdma_reply_name =
+                aws_s3_rdma_provider_get_rdma_reply_header_name(client->rdma_provider);
+            struct aws_byte_cursor rdma_reply_value;
+            AWS_ZERO_STRUCT(rdma_reply_value);
+            if (aws_http_headers_get(request->send_data.response_headers, rdma_reply_name, &rdma_reply_value) ==
+                AWS_OP_SUCCESS) {
+                rdma_reply_absent_or_501 = aws_byte_cursor_eq_c_str(&rdma_reply_value, "501");
+            }
+        }
+
+        if (rdma_reply_absent_or_501) {
+            AWS_LOGF_INFO(
+                AWS_LS_S3_META_REQUEST,
+                "id=%p RDMA %s declined by server (HTTP 501); disabling RDMA and retrying over HTTP",
+                (void *)meta_request,
+                request->request_type == AWS_S3_REQUEST_TYPE_UPLOAD_PART ? "UploadPart" : "PutObject");
+            request->disable_rdma_on_retry = 1;
+            error_code = AWS_ERROR_S3_INTERNAL_ERROR;
+            aws_raise_error(error_code);
+        }
+    }
+
     AWS_LOGF_DEBUG(
         AWS_LS_S3_META_REQUEST,
         "id=%p: Request %p finished with error code %d (%s) and response status %d, x-amz-request-id: %s, x-amz-id-2: "
