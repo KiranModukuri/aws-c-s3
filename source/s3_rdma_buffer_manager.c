@@ -82,6 +82,22 @@ static int s_default_prepare_buffer_for_rdma(
         AWS_LOGF_DEBUG(AWS_LS_S3_RDMA, "id=%p Buffer not suitable for RDMA", (void *)manager);
         return AWS_OP_SUCCESS;
     }
+
+    /* Run before register callback */
+    struct aws_s3_meta_request *meta_request = request->meta_request;
+    if (meta_request->user_buffer_options.before_register_callback) {
+        int before_result = meta_request->user_buffer_options.before_register_callback(meta_request->user_data);
+        AWS_LOGF_DEBUG(AWS_LS_S3_RDMA, "id=%p Run before register function", (void *)manager);
+        if (before_result != AWS_OP_SUCCESS) {
+            AWS_LOGF_ERROR(
+                AWS_LS_S3_META_REQUEST,
+                "id=%p Part %u: Before register function failed (result=%d)",
+                (void *)meta_request,
+                request->part_number,
+                before_result);
+            return before_result;
+        }
+    }
     
     /* Register buffer with RDMA provider */
     int register_result = aws_s3_rdma_provider_register_memory(manager->rdma_provider, buffer, buffer_size);
